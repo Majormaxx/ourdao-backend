@@ -28,6 +28,7 @@ import { getConnectedStreamCount, getNotificationFailureCount, registerStreamEnd
 import { historicalOrLive, setCachePolicy } from '../cache-policy.js'
 import { ConcurrencyGate } from '../load-shedding.js'
 import { withLoanDerived } from '../loan-derived.js'
+import { createHistoryCache } from '../history-cache.js'
 
 function parseLimit(v: unknown, def = 50, max = 200): number | null {
   if (v === undefined || v === null || v === '') return def
@@ -135,6 +136,8 @@ async function entityTimeline(symbols: readonly string[], id: string): Promise<T
 
 export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: NonceStore }): Promise<void> {
   const { nonceStore } = opts
+  const historyCache = createHistoryCache()
+  app.addHook('onClose', async () => historyCache.close())
 
   // --- SSE stream (issues #63, #158) ---
   // Registered inside the `/api` plugin so it inherits the prefix and any
@@ -878,5 +881,90 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     } finally {
       statsGate.release()
     }
+  })
+
+  app.get('/stats/history', {
+    schema: {
+      tags: ['Stats'],
+      summary: 'Historical daily loan aggregates',
+      response: {
+        200: {
+          type: 'object',
+          required: ['data'],
+          properties: {
+            data: {
+              type: 'array',
+              items: {
+                type: 'object',
+                required: ['date', 'principalLent', 'principalRepaid', 'defaults', 'valueDefaulted', 'cumulativeDefaultRatePercent'],
+                properties: {
+                  date: { type: 'string', format: 'date' },
+                  principalLent: { type: 'string' },
+                  principalRepaid: { type: 'string' },
+                  defaults: { type: 'integer' },
+                  valueDefaulted: { type: 'string' },
+                  cumulativeDefaultRatePercent: { type: 'number' },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  }, async (_req, reply) => {
+    setCachePolicy(reply, 'public-live')
+    const cached = await historyCache.get()
+    if (cached) return cached
+
+    const rows = await query<{
+      day: string
+      principal_lent: string
+      principal_repaid: string
+      defaults_count: number
+      value_defaulted: string
+      cumulative_originated: string
+      cumulative_defaults: string
+    }>(
+      `WITH bounds AS (
+         SELECT min(day) AS first_day, (now() AT TIME ZONE 'UTC')::date AS last_day
+           FROM daily_loan_stats
+       ), calendar AS (
+         SELECT generate_series(first_day, last_day, interval '1 day')::date AS day
+           FROM bounds
+          WHERE first_day IS NOT NULL
+       ), daily AS (
+         SELECT day, principal_lent, principal_repaid, defaults_count, value_defaulted,
+                loans_originated
+           FROM daily_loan_stats
+       )
+       SELECT calendar.day::text AS day,
+              COALESCE(daily.principal_lent, 0)::text AS principal_lent,
+              COALESCE(daily.principal_repaid, 0)::text AS principal_repaid,
+              COALESCE(daily.defaults_count, 0) AS defaults_count,
+              COALESCE(daily.value_defaulted, 0)::text AS value_defaulted,
+              SUM(COALESCE(daily.loans_originated, 0)) OVER (ORDER BY calendar.day)::text AS cumulative_originated,
+              SUM(COALESCE(daily.defaults_count, 0)) OVER (ORDER BY calendar.day)::text AS cumulative_defaults
+         FROM calendar
+         LEFT JOIN daily USING (day)
+        ORDER BY calendar.day`
+    )
+    const result = {
+      data: rows.map((row) => {
+        const originated = Number(row.cumulative_originated)
+        const defaults = Number(row.cumulative_defaults)
+        return {
+          date: row.day,
+          principalLent: row.principal_lent,
+          principalRepaid: row.principal_repaid,
+          defaults: row.defaults_count,
+          valueDefaulted: row.value_defaulted,
+          cumulativeDefaultRatePercent: originated === 0
+            ? 0
+            : Number(((defaults / originated) * 100).toFixed(4)),
+        }
+      }),
+    }
+    await historyCache.set(result)
+    return result
   })
 }

@@ -160,6 +160,9 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // pool is created, defaulting to `api`).
     applicationName: str(env, 'DB_APPLICATION_NAME') || `ourdao-${str(env, 'OURDAO_PROCESS_ROLE', 'api')}`,
   },
+  cache: {
+    historyRedisUrl: str(env, 'REDIS_URL') || undefined,
+  },
   stellar: {
     contractId: str(env, 'CONTRACT_ID'),
     rpcUrl: str(env, 'SOROBAN_RPC_URL', 'https://soroban-testnet.stellar.org'),

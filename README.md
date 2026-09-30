@@ -121,6 +121,7 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `RATE_LIMIT_WINDOW_MS` | Rate limit window in milliseconds (default 60000). |
 | `RATE_LIMIT_EVENTS_MAX` | Stricter rate limit for `GET /api/events` (default 30). |
 | `STATS_CACHE_MS` | How long (ms) an `/api/stats` result is cached in-process before it is recomputed (default 5000; `0` disables). Reported figures are at most this stale. |
+| `REDIS_URL` | Optional Redis connection URL for the one-hour shared cache on `/api/stats/history`; without it, the endpoint uses an in-process cache. |
 | `STREAM_MAX_CONNECTIONS` | Max concurrent `/api/stream` SSE connections per process (default 100). Excess connections get `503` + `Retry-After` (issue #156). |
 | `STREAM_MAX_CONNECTIONS_PER_IP` | Max concurrent stream connections per client IP (default 10). |
 | `STREAM_IDLE_TIMEOUT_MS` | Socket idle timeout for stream connections in ms (default 60000). Heartbeats keep healthy clients alive. |
@@ -230,6 +231,7 @@ Base path: `/api`.
 - `GET /ready` — Readiness probe (checks Postgres reachability and indexer freshness)
 - `GET /version` — Build metadata (version, commit, build date)
 - `GET /api/stats` — Aggregate DAO statistics (members, loans, proposals, money figures, quarantine count, indexer state)
+- `GET /api/stats/history` — Daily loan principal lent/repaid, defaults, defaulted value, and cumulative default rate (`data` timeseries; money values are decimal strings)
 
 **Members:**
 - `GET /api/members` — Active members list
@@ -339,7 +341,7 @@ Every response's `Cache-Control` comes from one of four **named policies** defin
 
 | Policy | Header | Applies to |
 |---|---|---|
-| `public-live` | `public, max-age=5, must-revalidate` | Tip-of-chain reads: `/members`, `/members/:address`, `/members/:address/activity`, `/proposals/*`, `/loans`, `/loans/:id`, the two `/timeline` routes, `/stats`, and `/events`, `/admin/log`, `/interest`, `/documents` **without** a cursor. |
+| `public-live` | `public, max-age=5, must-revalidate` | Tip-of-chain reads: `/members`, `/members/:address`, `/members/:address/activity`, `/proposals/*`, `/loans`, `/loans/:id`, the two `/timeline` routes, `/stats`, `/stats/history`, and `/events`, `/admin/log`, `/interest`, `/documents` **without** a cursor. |
 | `public-historical` | `public, max-age=31536000, immutable` | `/events` (`?before=`/`?after=`), `/admin/log`, `/interest`, `/documents` with a cursor. |
 | `private` | `private, no-cache` | Member-specific data: `/members/:address/summary`, `/notifications`. Never `public`. |
 | `no-store` | `no-store` | Authentication challenges, `PATCH` mutations, `/health`, `/ready`, `/version`, `/admin/failed-events`, and the `/stream` SSE endpoint. |

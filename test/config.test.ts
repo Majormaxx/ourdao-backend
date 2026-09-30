@@ -89,6 +89,9 @@ describe('resolveConfig', () => {
         idleTimeoutMs: 30000,
         applicationName: 'ourdao-api',
       },
+      cache: {
+        historyRedisUrl: undefined,
+      },
       stellar: {
         contractId: '',
         rpcUrl: 'https://soroban-testnet.stellar.org',
