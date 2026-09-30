@@ -240,8 +240,21 @@ CREATE TABLE IF NOT EXISTS failed_events (
   ledger      BIGINT NOT NULL,
   error       TEXT NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-  resolved_at TIMESTAMPTZ
+  resolved_at TIMESTAMPTZ,
+  -- Why a record was resolved and an optional operator note (migration 0026,
+  -- issue #287); nullable so rows resolved by reindex/replay stay valid.
+  resolution  TEXT,
+  resolution_note TEXT
 );
+-- A database bootstrapped before migration 0026 already has the table, so the
+-- CREATE above no-ops; add the columns the same idempotent way the migration does.
+ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS resolution TEXT;
+ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS resolution_note TEXT;
+DO $$ BEGIN
+  ALTER TABLE failed_events ADD CONSTRAINT failed_events_resolution_check
+    CHECK (resolution IS NULL OR resolution IN ('resolved', 'ignored'));
+EXCEPTION WHEN duplicate_table OR duplicate_object THEN NULL;
+END $$;
 -- One row per distinct failing event (migration 0022, issue #171).
 DO $$ BEGIN
   ALTER TABLE failed_events ADD CONSTRAINT failed_events_event_id_unique UNIQUE (event_id);

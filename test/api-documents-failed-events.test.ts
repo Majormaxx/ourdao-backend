@@ -296,8 +296,8 @@ describe('API: POST /api/admin/failed-events/batch-resolve (issue #287)', () => 
       `SELECT resolution, resolution_note FROM failed_events WHERE id = $1`,
       [ids[0]]
     )
-    expect(row[0].resolution).toBe('ignored')
-    expect(row[0].resolution_note).toBeNull()
+    expect(row[0]?.resolution).toBe('ignored')
+    expect(row[0]?.resolution_note).toBeNull()
   })
 
   it('excludes an already-resolved id from the count rather than erroring the batch', async () => {

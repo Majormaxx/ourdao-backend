@@ -253,6 +253,8 @@ async function fetchMemberSummary(address: string): Promise<MemberSummary | null
   `, [address])
 
   return row?.summary ?? null
+}
+
 // Issue #291: write one row to admin_audit_log for every authenticated admin
 // action. Called fire-and-forget — a logging failure must never block the
 // action itself; errors are logged via the request logger so they appear in
@@ -974,6 +976,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       return reply.code(422).send({ eventId: outcome.eventId, status: outcome.status })
     }
     return { eventId: outcome.eventId, status: outcome.status }
+  })
+
   // Issue #287: resolving quarantined events one at a time via direct SQL
   // doesn't scale once a bad handler/schema change quarantines a batch of
   // them at once. Accepts up to 500 ids per call (matching this codebase's
@@ -1015,6 +1019,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     })
 
     return { resolved: resolvedCount }
+  })
+
   // --- Admin audit log (issue #291) ---
   // Exposes the immutable admin_audit_log table to authorized maintainers.
   // Authentication is required: only a holder of a valid Stellar signature
@@ -1046,7 +1052,9 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     }
     // Optional filter by action type — any non-empty string is accepted so
     // future action labels don't require a server deploy to query.
-    if (q.action !== undefined && (typeof q.action !== 'string' || q.action.trim() === '')) {
+    // An empty `?action=` means "no filter", like every other optional
+    // string filter in this file; only a non-string (repeated param) is an error.
+    if (q.action !== undefined && typeof q.action !== 'string') {
       return reply.code(400).send({ error: 'invalid action filter' })
     }
 

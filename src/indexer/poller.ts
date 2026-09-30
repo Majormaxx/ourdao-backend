@@ -10,7 +10,6 @@ import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
 import { REINDEX_LOCK_KEY } from './reindex.js'
 import { notifyStreamClientsAfterCommit, STREAM_CHANNELS, type StreamChannel } from '../api/stream.js'
 import { invalidateCache, invalidateMembersListCache, memberSummaryCacheKey } from '../cache/redis.js'
-import { notifyStreamClientsAfterCommit, type StreamChannel } from '../api/stream.js'
 import { getTracer } from '../telemetry.js'
 
 interface CursorRow {
