@@ -5,6 +5,38 @@ import { STREAM_CHANNELS, type StreamChannel } from '../api/stream.js'
 import { getTracer } from '../telemetry.js'
 import type { NotificationType } from '../types.js'
 
+async function incrementDailyLoanStats(
+  client: PoolClient,
+  ev: DecodedEvent,
+  deltas: {
+    loansOriginated?: number
+    principalLent?: string
+    principalRepaid?: string
+    defaultsCount?: number
+    valueDefaulted?: string
+  }
+): Promise<void> {
+  await client.query(
+    `INSERT INTO daily_loan_stats
+       (day, loans_originated, principal_lent, principal_repaid, defaults_count, value_defaulted)
+     VALUES (($1::timestamptz AT TIME ZONE 'UTC')::date, $2, $3, $4, $5, $6)
+     ON CONFLICT (day) DO UPDATE SET
+       loans_originated = daily_loan_stats.loans_originated + EXCLUDED.loans_originated,
+       principal_lent = daily_loan_stats.principal_lent + EXCLUDED.principal_lent,
+       principal_repaid = daily_loan_stats.principal_repaid + EXCLUDED.principal_repaid,
+       defaults_count = daily_loan_stats.defaults_count + EXCLUDED.defaults_count,
+       value_defaulted = daily_loan_stats.value_defaulted + EXCLUDED.value_defaulted`,
+    [
+      ev.closedAt,
+      deltas.loansOriginated ?? 0,
+      deltas.principalLent ?? '0',
+      deltas.principalRepaid ?? '0',
+      deltas.defaultsCount ?? 0,
+      deltas.valueDefaulted ?? '0',
+    ]
+  )
+}
+
 // Helpers ------------------------------------------------------------------
 //
 // `str`/`num`/`addr` below coerce a missing/malformed field into a plausible
@@ -346,6 +378,7 @@ const handlers: Record<string, Handler> = {
         `UPDATE dao_totals SET principal_lent = principal_lent + $1, updated_at = now() WHERE id = 1`,
         [amount]
       )
+      await incrementDailyLoanStats(client, ev, { loansOriginated: 1, principalLent: amount })
     }
     await client.query(
       `UPDATE members SET has_active_loan = true WHERE address = $1`,
@@ -379,6 +412,7 @@ const handlers: Record<string, Handler> = {
         `UPDATE dao_totals SET principal_repaid = principal_repaid + $1, updated_at = now() WHERE id = 1`,
         [loan.amount]
       )
+      await incrementDailyLoanStats(client, ev, { principalRepaid: loan.amount })
     }
     if (status === 'repaid') {
       await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [borrower])
@@ -413,6 +447,10 @@ const handlers: Record<string, Handler> = {
       `UPDATE dao_totals SET value_defaulted = value_defaulted + $1, updated_at = now() WHERE id = 1`,
       [updated.rows[0]?.outstanding ?? '0']
     )
+    await incrementDailyLoanStats(client, ev, {
+      defaultsCount: 1,
+      valueDefaulted: updated.rows[0]?.outstanding ?? '0',
+    })
 
     await client.query(
       `UPDATE members

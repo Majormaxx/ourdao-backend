@@ -193,6 +193,17 @@ CREATE TABLE IF NOT EXISTS dao_totals (
 );
 INSERT INTO dao_totals (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
+-- Daily loan chart aggregates, updated in the same transaction as each
+-- lifecycle event and rebuilt from the raw event log during reindex.
+CREATE TABLE IF NOT EXISTS daily_loan_stats (
+  day                 DATE PRIMARY KEY,
+  loans_originated    INTEGER NOT NULL DEFAULT 0,
+  principal_lent      NUMERIC(40,0) NOT NULL DEFAULT 0,
+  principal_repaid    NUMERIC(40,0) NOT NULL DEFAULT 0,
+  defaults_count      INTEGER NOT NULL DEFAULT 0,
+  value_defaulted     NUMERIC(40,0) NOT NULL DEFAULT 0
+);
+
 -- One row per `interest` event: the distribution history (issue #24).
 -- `event_id` is the raw events.id and is UNIQUE so a re-delivered event
 -- folds exactly once.
