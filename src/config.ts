@@ -63,6 +63,42 @@ export function parseCorsOrigin(raw: string | undefined): string {
   return origins.length === 1 ? origins[0]! : origins.join(',')
 }
 
+/**
+ * Parses `STELLAR_RPC_HEADERS` (issue #284) into the header map
+ * `rpc.Server`'s `headers` option expects, so a managed Soroban RPC provider
+ * (QuickNode and similar) that requires an API key or bearer token can be
+ * authenticated against. Format: `Name1:Value1,Name2:Value2` — a colon
+ * separates each header's name from its value, a comma separates entries.
+ * A value may itself contain colons (e.g. `Authorization:Bearer abc:def`);
+ * only the first colon in an entry is treated as the separator.
+ *
+ * Malformed entries (no colon, or an empty name) are skipped with a warning
+ * rather than silently producing a broken header, since a header the RPC
+ * provider doesn't recognize fails requests in a way that's hard to trace
+ * back to a config typo.
+ */
+export function parseStellarRpcHeaders(raw: string | undefined): Record<string, string> {
+  const trimmed = (raw ?? '').trim()
+  if (trimmed === '') return {}
+
+  const headers: Record<string, string> = {}
+  for (const entry of trimmed.split(',')) {
+    const piece = entry.trim()
+    if (!piece) continue
+    const separatorIndex = piece.indexOf(':')
+    // separatorIndex <= 0 covers both "no colon at all" (-1) and "colon is
+    // the first character" (0, an empty name) in one check.
+    if (separatorIndex <= 0) {
+      console.warn(`[config] Ignoring malformed STELLAR_RPC_HEADERS entry (expected "Name:Value"): "${piece}"`)
+      continue
+    }
+    const name = piece.slice(0, separatorIndex).trim()
+    const value = piece.slice(separatorIndex + 1).trim()
+    headers[name] = value
+  }
+  return headers
+}
+
 /** Resolved runtime configuration, read once at import time. */
 export function resolveConfig(env: NodeJS.ProcessEnv) {
   return {
@@ -163,6 +199,9 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
   stellar: {
     contractId: str(env, 'CONTRACT_ID'),
     rpcUrl: str(env, 'SOROBAN_RPC_URL', 'https://soroban-testnet.stellar.org'),
+    // Issue #284: custom headers (API key, bearer token) for managed/private
+    // Soroban RPC providers. Never log this value — see parseStellarRpcHeaders.
+    rpcHeaders: parseStellarRpcHeaders(env.STELLAR_RPC_HEADERS),
     networkPassphrase: str(env, 'NETWORK_PASSPHRASE', 'Test SDF Network ; September 2015'),
     // Stellar's nominal ledger close time (issue #139) — used by `/ready` to
     // turn a ledger-count lag into an estimated seconds-behind figure. Not an

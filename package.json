@@ -28,6 +28,7 @@
     "license:check": "tsx scripts/check-licenses.ts"
   },
   "dependencies": {
+    "@fastify/compress": "^7.0.3",
     "@fastify/cors": "^10.0.1",
     "@fastify/etag": "^6.2.0",
     "@fastify/rate-limit": "^11.2.0",

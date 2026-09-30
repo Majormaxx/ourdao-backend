@@ -2,8 +2,15 @@ import { rpc } from '@stellar/stellar-sdk'
 import { config } from '../config.js'
 
 // Allow http:// for local/standalone RPC while defaulting to secure transport.
+// `headers` (issue #284) lets a managed/private RPC provider (QuickNode and
+// similar) require an API key or bearer token — only set when
+// STELLAR_RPC_HEADERS is non-empty, since passing `headers: {}` is harmless
+// but passing `undefined` more clearly reflects "not configured" if the SDK
+// ever branches on the option's presence rather than its contents.
+const rpcHeaders = config.stellar.rpcHeaders
 export const server = new rpc.Server(config.stellar.rpcUrl, {
   allowHttp: config.stellar.rpcUrl.startsWith('http://'),
+  ...(Object.keys(rpcHeaders).length > 0 ? { headers: rpcHeaders } : {}),
 })
 
 export async function getLatestLedger(): Promise<number> {

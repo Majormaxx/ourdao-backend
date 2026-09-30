@@ -28,6 +28,7 @@ import { getConnectedStreamCount, getNotificationFailureCount, registerStreamEnd
 import { historicalOrLive, setCachePolicy } from '../cache-policy.js'
 import { ConcurrencyGate } from '../load-shedding.js'
 import { withLoanDerived } from '../loan-derived.js'
+import { replayFailedEvent } from '../../indexer/replay.js'
 
 function parseLimit(v: unknown, def = 50, max = 200): number | null {
   if (v === undefined || v === null || v === '') return def
@@ -734,6 +735,35 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       params
     )
     return rows
+  })
+
+  // --- Re-evaluate a quarantined event (issue #283) ---
+  // The middle ground between "leave it quarantined" and `npm run reindex`
+  // (which rebuilds every derived table from the entire raw log): re-attempt
+  // the fold for exactly this one event, once a contract or decoder fix has
+  // shipped, without a maintainer hand-editing `failed_events`/`events` over
+  // psql. All the actual logic (advisory-lock coordination with the live
+  // poller/reindex, idempotency, updating the existing failed_events row
+  // rather than inserting a new one) already lives in
+  // `indexer/replay.ts`'s `replayFailedEvent` — added for `npm run
+  // replay-failed` (issue #170) — this route is the HTTP door onto it.
+  //
+  // Same "operator diagnostics, no auth scheme" posture as
+  // GET /admin/failed-events above: reachable without authentication, but a
+  // still-failing replay's raw exception text is never echoed back (only
+  // logged, by replayFailedEvent itself) — mirroring classifyError's rule.
+  app.post<{ Params: { id: string } }>('/admin/failed-events/:id/re-evaluate', async (req, reply) => {
+    const eventId = req.params.id.trim()
+    if (!eventId) return reply.code(400).send({ error: 'invalid event id' })
+
+    // Propagates uncaught on a lock conflict (ReplayLockError carries its
+    // own statusCode; classifyError formats it) or any other unexpected
+    // throw (falls through to a generic 500, message withheld).
+    const outcome = await replayFailedEvent(eventId)
+    if (outcome.status === 'still_failing') {
+      return reply.code(422).send({ eventId: outcome.eventId, status: outcome.status })
+    }
+    return { eventId: outcome.eventId, status: outcome.status }
   })
 
   // --- Aggregate stats (with indexer freshness — issue #2) ---
