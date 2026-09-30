@@ -1,6 +1,8 @@
 import type { PoolClient } from 'pg'
+import { SpanStatusCode } from '@opentelemetry/api'
 import { isKnownSymbol, warnUnknownSymbol, type DecodedEvent } from '../stellar/events.js'
 import { STREAM_CHANNELS, type StreamChannel } from '../api/stream.js'
+import { getTracer } from '../telemetry.js'
 import type { NotificationType } from '../types.js'
 
 // Helpers ------------------------------------------------------------------
@@ -704,7 +706,27 @@ export async function applyEvent(client: PoolClient, ev: DecodedEvent): Promise<
   if (!isKnownSymbol(ev.symbol)) warnUnknownSymbol(ev)
 
   const handler = handlers[ev.symbol]
-  if (handler) await handler(client, ev)
+  // Issue #288: one span per event, whether or not a handler actually runs
+  // for it (an unknown symbol is still worth seeing in a trace) — visibility
+  // into which handlers are slowest during high transaction volume is the
+  // whole point, and skipping the no-handler case would silently exclude
+  // whatever fraction of events those are from that picture.
+  await getTracer().startActiveSpan('indexer.apply_event', async (span) => {
+    span.setAttribute('event.symbol', ev.symbol)
+    if (typeof ev.ledger === 'number') span.setAttribute('event.ledger', ev.ledger)
+    span.setAttribute('event.has_handler', handler !== undefined)
+    const startedAt = performance.now()
+    try {
+      if (handler) await handler(client, ev)
+    } catch (err) {
+      span.recordException(err instanceof Error ? err : String(err))
+      span.setStatus({ code: SpanStatusCode.ERROR })
+      throw err
+    } finally {
+      span.setAttribute('event.handler_duration_ms', performance.now() - startedAt)
+      span.end()
+    }
+  })
 
   return channelMap[ev.symbol]
 }

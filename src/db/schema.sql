@@ -19,7 +19,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Indexer resume state (single row, id = 1).
+-- Indexer resume state — one row per tailed contract, primary-keyed on
+-- contract_id (issue #289: multi-contract tailing needs an independent
+-- cursor per contract; a pre-#289 single-contract deployment just has one
+-- row here). `id` survives only as a vestigial nullable column so any
+-- database that predates #289 doesn't need it dropped by hand; it's never
+-- read or written by current code.
 -- `last_ledger_hash` is the hash of `last_ledger` itself — the ledger
 -- actually folded to (issue #127) — fetched by sequence from the RPC
 -- (Soroban getEvents exposes no per-event hash). Re-checked against the
@@ -32,14 +37,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 -- getEvents page must never advance `last_ledger` from this value; see
 -- README "Reorg detection" and src/indexer/poller.ts.
 CREATE TABLE IF NOT EXISTS indexer_cursor (
-  id                  SMALLINT PRIMARY KEY DEFAULT 1,
+  id                  SMALLINT,
   paging_token        TEXT,
   last_ledger         BIGINT,
   last_ledger_hash    TEXT,
   observed_tip_ledger BIGINT,
-  contract_id         TEXT,
-  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT indexer_cursor_singleton CHECK (id = 1)
+  contract_id         TEXT PRIMARY KEY,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Raw event log — the append-only source every derived table is built from.

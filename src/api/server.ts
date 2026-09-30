@@ -214,8 +214,13 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     // 2. Indexer cursor state
     let row: CursorRow | null = null
     try {
+      // Issue #289: indexer_cursor now has one row per tailed contract
+      // instead of a single id=1 row. Freshness/readiness reflects the
+      // *worst* (least recently updated) contract — the system as a whole
+      // isn't ready if any one tailed contract has fallen behind — which is
+      // also exactly the single-contract behavior when there's only one row.
       row = await pool
-        .query<CursorRow>('SELECT last_ledger, observed_tip_ledger, updated_at FROM indexer_cursor WHERE id = 1')
+        .query<CursorRow>('SELECT last_ledger, observed_tip_ledger, updated_at FROM indexer_cursor ORDER BY updated_at ASC NULLS FIRST LIMIT 1')
         .then((r) => r.rows[0] ?? null)
     } catch {
       // Table may not exist yet — treat as cold start

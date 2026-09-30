@@ -221,10 +221,15 @@ class SharedListener {
       await client.connect()
 
       try {
-        const cursor = await client.query<{ last_ledger: number | null }>(
-          'SELECT last_ledger FROM indexer_cursor WHERE id = 1'
+        // Issue #289: indexer_cursor now has one row per tailed contract.
+        // MAX(last_ledger) matches this frontier's own semantics (the
+        // highest ledger carried by any change notification seen so far,
+        // regardless of which contract it came from) and is exactly the
+        // single-contract behavior when there's only one row.
+        const cursor = await client.query<{ max: number | null }>(
+          'SELECT MAX(last_ledger) FROM indexer_cursor'
         )
-        const seeded = cursor.rows[0]?.last_ledger
+        const seeded = cursor.rows[0]?.max
         // Guard against moving the frontier backwards (matches
         // dispatchStreamNotification's own guard) — a reconnect can race a
         // NOTIFY that already advanced `knownLedger.value` past this SELECT.

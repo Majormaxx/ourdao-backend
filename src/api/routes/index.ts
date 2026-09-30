@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { StrKey } from '@stellar/stellar-sdk'
-import { query, queryOne } from '../../db/index.js'
+import { query, queryOne, withTransaction } from '../../db/index.js'
 import { config } from '../../config.js'
 import {
   ADMIN_EVENT_SYMBOLS,
@@ -766,6 +766,47 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     return rows
   })
 
+  // Issue #287: resolving quarantined events one at a time via direct SQL
+  // doesn't scale once a bad handler/schema change quarantines a batch of
+  // them at once. Accepts up to 500 ids per call (matching this codebase's
+  // other batch-size ceilings) and only touches rows that are still
+  // unresolved — an id that's already resolved, or doesn't exist, is
+  // silently excluded from the count rather than erroring the whole batch,
+  // since a stale/duplicate id in an admin's list shouldn't block resolving
+  // the rest.
+  const MAX_BATCH_RESOLVE_IDS = 500
+  app.post('/admin/failed-events/batch-resolve', async (req, reply) => {
+    const body = req.body as { ids?: unknown; resolution?: unknown; note?: unknown }
+    const ids = body.ids
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return reply.code(400).send({ error: 'ids must be a non-empty array' })
+    }
+    if (ids.length > MAX_BATCH_RESOLVE_IDS) {
+      return reply.code(400).send({ error: `ids must not exceed ${MAX_BATCH_RESOLVE_IDS} entries` })
+    }
+    if (!ids.every((id) => Number.isSafeInteger(id) && id > 0)) {
+      return reply.code(400).send({ error: 'ids must all be positive integers' })
+    }
+    const resolution = body.resolution
+    if (resolution !== 'resolved' && resolution !== 'ignored') {
+      return reply.code(400).send({ error: "resolution must be 'resolved' or 'ignored'" })
+    }
+    const note = body.note
+    if (note !== undefined && typeof note !== 'string') {
+      return reply.code(400).send({ error: 'note must be a string' })
+    }
+
+    const resolvedCount = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE failed_events
+            SET resolved_at = now(), resolution = $1, resolution_note = $2
+          WHERE id = ANY($3::bigint[]) AND resolved_at IS NULL`,
+        [resolution, note ?? null, ids]
+      )
+      return result.rowCount ?? 0
+    })
+
+    return { resolved: resolvedCount }
   // --- Admin audit log (issue #291) ---
   // Exposes the immutable admin_audit_log table to authorized maintainers.
   // Authentication is required: only a holder of a valid Stellar signature
@@ -883,9 +924,16 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
          (SELECT principal_repaid   FROM dao_totals WHERE id = 1)                  AS principal_repaid,
          (SELECT value_defaulted    FROM dao_totals WHERE id = 1)                  AS value_defaulted,
          (SELECT count(*) FROM failed_events WHERE resolved_at IS NULL)            AS quarantined_events,
-         (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
-         (SELECT observed_tip_ledger FROM indexer_cursor WHERE id = 1)             AS observed_tip_ledger,
-         (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at,
+         -- Issue #289: indexer_cursor has one row per tailed contract now.
+         -- Same "worst row wins" aggregation as /ready — last_ledger,
+         -- observed_tip_ledger and cursor_updated_at must come from the
+         -- *same* row (the least-recently-updated one) so the freshness
+         -- figures derived from them below stay internally consistent,
+         -- rather than each column independently picking a different
+         -- contract's value.
+         (SELECT last_ledger FROM indexer_cursor ORDER BY updated_at ASC NULLS FIRST LIMIT 1) AS last_ledger,
+         (SELECT observed_tip_ledger FROM indexer_cursor ORDER BY updated_at ASC NULLS FIRST LIMIT 1) AS observed_tip_ledger,
+         (SELECT updated_at FROM indexer_cursor ORDER BY updated_at ASC NULLS FIRST LIMIT 1) AS cursor_updated_at,
          (SELECT escalated_at FROM quarantine_state WHERE id = 1)                  AS quarantine_escalated_at`
     )
     const cursorUpdatedAt = row?.cursor_updated_at

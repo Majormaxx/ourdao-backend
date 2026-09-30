@@ -93,7 +93,7 @@ describe('API: /health and /ready', () => {
 
   it('GET /ready returns 200 when cursor is fresh', async () => {
     await query(
-      `INSERT INTO indexer_cursor (id, last_ledger, updated_at) VALUES (1, 100, now())`
+      `INSERT INTO indexer_cursor (contract_id, last_ledger, updated_at) VALUES ('CTEST', 100, now())`
     )
     const res = await app.inject({ method: 'GET', url: '/ready' })
     expect(res.statusCode).toBe(200)
@@ -112,7 +112,7 @@ describe('API: /health and /ready', () => {
     await query('ALTER TABLE indexer_cursor ALTER COLUMN updated_at DROP NOT NULL')
     try {
       await query(
-        `INSERT INTO indexer_cursor (id, last_ledger, updated_at) VALUES (1, 100, NULL)`
+        `INSERT INTO indexer_cursor (contract_id, last_ledger, updated_at) VALUES ('CTEST', 100, NULL)`
       )
       const res = await app.inject({ method: 'GET', url: '/ready' })
       expect(res.statusCode).toBe(200)
@@ -129,7 +129,7 @@ describe('API: /health and /ready', () => {
 
   it('GET /ready derives estimatedLagSeconds from the configured ledger close time, not a bare literal (issue #139)', async () => {
     await query(
-      `INSERT INTO indexer_cursor (id, last_ledger, observed_tip_ledger, updated_at) VALUES (1, 100, 104, now())`
+      `INSERT INTO indexer_cursor (contract_id, last_ledger, observed_tip_ledger, updated_at) VALUES ('CTEST', 100, 104, now())`
     )
     const res = await app.inject({ method: 'GET', url: '/ready' })
     expect(res.statusCode).toBe(200)
@@ -141,7 +141,7 @@ describe('API: /health and /ready', () => {
   it('GET /ready returns 503 when cursor is stale', async () => {
     // Set updated_at to 10 minutes ago (well past default 120s threshold)
     await query(
-      `INSERT INTO indexer_cursor (id, last_ledger, updated_at) VALUES (1, 100, now() - interval '10 minutes')`
+      `INSERT INTO indexer_cursor (contract_id, last_ledger, updated_at) VALUES ('CTEST', 100, now() - interval '10 minutes')`
     )
     const res = await app.inject({ method: 'GET', url: '/ready' })
     expect(res.statusCode).toBe(503)
@@ -163,7 +163,7 @@ describe('API: /api/stats includes freshness', () => {
 
   it('GET /api/stats returns freshness fields', async () => {
     await query(
-      `INSERT INTO indexer_cursor (id, last_ledger, updated_at) VALUES (1, 500, now())`
+      `INSERT INTO indexer_cursor (contract_id, last_ledger, updated_at) VALUES ('CTEST', 500, now())`
     )
     const res = await app.inject({ method: 'GET', url: '/api/stats' })
     expect(res.statusCode).toBe(200)
@@ -175,7 +175,7 @@ describe('API: /api/stats includes freshness', () => {
 
   it('GET /api/stats reports stale when cursor is old', async () => {
     await query(
-      `INSERT INTO indexer_cursor (id, last_ledger, updated_at) VALUES (1, 500, now() - interval '3 minutes')`
+      `INSERT INTO indexer_cursor (contract_id, last_ledger, updated_at) VALUES ('CTEST', 500, now() - interval '3 minutes')`
     )
     const res = await app.inject({ method: 'GET', url: '/api/stats' })
     const body = res.json()

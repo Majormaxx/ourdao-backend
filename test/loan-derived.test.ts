@@ -43,11 +43,50 @@ describe('withLoanDerived (issue #195)', () => {
       const d = withLoanDerived(loan({ amount: bad }), log)
       expect(d.interest_charge).toBeNull()
       expect(d.repaid_amount).toBeNull()
+      expect(d.repayment_progress_bps).toBeNull()
       expect(d.id).toBe(1)
     }
     expect(warnings).toHaveLength(5)
     expect(warnings[0]).toMatchObject({ loanId: 1 })
     expect(parseIntegerAmount(null)).toBeNull()
+  })
+})
+
+describe('repayment_progress_bps (issue #286)', () => {
+  it('is 0 bps when nothing has been repaid', () => {
+    const d = withLoanDerived(loan({ amount: '1000', total_repayment: '1080', outstanding: '1080' }))
+    expect(d.repaid_amount).toBe('0')
+    expect(d.repayment_progress_bps).toBe(0)
+  })
+
+  it('is 5000 bps at 50% repaid', () => {
+    const d = withLoanDerived(loan({ amount: '1000', total_repayment: '1000', outstanding: '500' }))
+    expect(d.repaid_amount).toBe('500')
+    expect(d.repayment_progress_bps).toBe(5000)
+  })
+
+  it('is 10000 bps once fully repaid', () => {
+    const d = withLoanDerived(loan({ amount: '1000', total_repayment: '1080', outstanding: '0' }))
+    expect(d.repaid_amount).toBe('1080')
+    expect(d.repayment_progress_bps).toBe(10000)
+  })
+
+  it('clamps at 10000 bps if outstanding is negative (bad upstream data)', () => {
+    const d = withLoanDerived(loan({ amount: '1000', total_repayment: '1000', outstanding: '-5' }))
+    expect(d.repayment_progress_bps).toBe(10000)
+  })
+
+  it('is 0 bps (not a division error) when total_repayment is 0', () => {
+    const d = withLoanDerived(loan({ amount: '0', total_repayment: '0', outstanding: '0' }))
+    expect(d.repayment_progress_bps).toBe(0)
+  })
+
+  it('handles amounts beyond Number.MAX_SAFE_INTEGER without losing precision', () => {
+    const total = '4000000000000000000000000000000' // 4e30, well beyond MAX_SAFE_INTEGER
+    const outstanding = '2000000000000000000000000000000' // 2e30 -> repaid = 2e30 = exactly 50%
+    const d = withLoanDerived(loan({ amount: '0', total_repayment: total, outstanding }))
+    expect(d.repaid_amount).toBe('2000000000000000000000000000000')
+    expect(d.repayment_progress_bps).toBe(5000)
   })
 })
 

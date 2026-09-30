@@ -54,7 +54,11 @@ export interface MemberSummary {
   // `position` below are computed over ALL of the member's loans regardless
   // of this cap, never just the embedded page.
   // Derived fields are null for a loan with a malformed amount column (issue #195).
-  loans: (LoanRow & { interest_charge: string | null; repaid_amount: string | null })[]
+  loans: (LoanRow & {
+    interest_charge: string | null
+    repaid_amount: string | null
+    repayment_progress_bps: number | null
+  })[]
   loans_total_count: number
   loans_truncated: boolean
   unread_notifications: number
@@ -189,6 +193,13 @@ export interface FailedEventRow {
   // Issue #168: set once a reindex or targeted replay (#170) re-folded this
   // event successfully. NULL means still outstanding.
   resolved_at: string | null
+  // Issue #287: how resolved_at came to be set via the batch-resolve admin
+  // endpoint — 'resolved' (the underlying issue was fixed/replayed) or
+  // 'ignored' (an operator decided it doesn't need fixing). NULL for rows
+  // resolved by a reindex (#168) rather than the batch endpoint, and for
+  // still-unresolved rows.
+  resolution: 'resolved' | 'ignored' | null
+  resolution_note: string | null
 }
 
 // Issue #291: machine-readable labels for every admin action type that is
