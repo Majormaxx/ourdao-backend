@@ -196,8 +196,21 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // pool is created, defaulting to `api`).
     applicationName: str(env, 'DB_APPLICATION_NAME') || `ourdao-${str(env, 'OURDAO_PROCESS_ROLE', 'api')}`,
   },
+  cache: {
+    historyRedisUrl: str(env, 'REDIS_URL') || undefined,
+  },
   stellar: {
     contractId: str(env, 'CONTRACT_ID'),
+    // Issue #289: multi-contract tailing (e.g. a governance DAO contract and
+    // a separate treasury vault contract) in one indexer process. CONTRACT_IDS
+    // is a comma-separated list and takes priority when set; CONTRACT_ID alone
+    // still works unchanged for existing single-contract deployments. Blank
+    // entries from stray commas/whitespace are dropped rather than producing
+    // an empty-string "contract" the RPC would reject.
+    contractIds: str(env, 'CONTRACT_IDS')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
     rpcUrl: str(env, 'SOROBAN_RPC_URL', 'https://soroban-testnet.stellar.org'),
     // Issue #284: custom headers (API key, bearer token) for managed/private
     // Soroban RPC providers. Never log this value — see parseStellarRpcHeaders.
@@ -234,6 +247,15 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // raw `events` log is left intact as an audit trail.
     resetOnContractChange: bool(env, 'INDEXER_RESET_ON_CONTRACT_CHANGE', false),
   },
+  otel: {
+    // Issue #288: tracing is opt-in — most local/dev/test runs have no OTLP
+    // collector to send spans to, and OpenTelemetry's own SDK already
+    // defaults to a no-op tracer when nothing registers a real provider, so
+    // this just controls whether src/telemetry.ts bothers registering one.
+    enabled: bool(env, 'OTEL_ENABLED', false),
+    exporterOtlpEndpoint: str(env, 'OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4318/v1/traces'),
+    serviceName: str(env, 'OTEL_SERVICE_NAME', 'ourdao-backend'),
+  },
   } as const
 }
 
@@ -249,4 +271,25 @@ export function assertContractConfigured(resolvedConfig: Config = config): strin
     )
   }
   return resolvedConfig.stellar.contractId
+}
+
+/** Issue #289: resolves the full set of contract ids to tail. CONTRACT_IDS
+ *  (comma-separated) takes priority; a single CONTRACT_ID is wrapped in a
+ *  one-element array for existing single-contract deployments. Throws if
+ *  neither is set, or if the same contract id appears more than once (that
+ *  would mean two independent cursor rows racing to fold the same events). */
+export function assertContractsConfigured(resolvedConfig: Config = config): string[] {
+  if (resolvedConfig.stellar.contractIds.length > 0) {
+    const seen = new Set<string>()
+    const dupes = new Set<string>()
+    for (const id of resolvedConfig.stellar.contractIds) {
+      if (seen.has(id)) dupes.add(id)
+      seen.add(id)
+    }
+    if (dupes.size > 0) {
+      throw new Error(`CONTRACT_IDS lists the same contract id more than once: ${[...dupes].join(', ')}`)
+    }
+    return resolvedConfig.stellar.contractIds
+  }
+  return [assertContractConfigured(resolvedConfig)]
 }

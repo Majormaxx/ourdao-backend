@@ -121,6 +121,7 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `RATE_LIMIT_WINDOW_MS` | Rate limit window in milliseconds (default 60000). |
 | `RATE_LIMIT_EVENTS_MAX` | Stricter rate limit for `GET /api/events` (default 30). |
 | `STATS_CACHE_MS` | How long (ms) an `/api/stats` result is cached in-process before it is recomputed (default 5000; `0` disables). Reported figures are at most this stale. |
+| `REDIS_URL` | Optional Redis connection URL for the one-hour shared cache on `/api/stats/history`; without it, the endpoint uses an in-process cache. |
 | `STREAM_MAX_CONNECTIONS` | Max concurrent `/api/stream` SSE connections per process (default 100). Excess connections get `503` + `Retry-After` (issue #156). |
 | `STREAM_MAX_CONNECTIONS_PER_IP` | Max concurrent stream connections per client IP (default 10). |
 | `STREAM_IDLE_TIMEOUT_MS` | Socket idle timeout for stream connections in ms (default 60000). Heartbeats keep healthy clients alive. |
@@ -230,6 +231,7 @@ Base path: `/api`.
 - `GET /ready` — Readiness probe (checks Postgres reachability and indexer freshness)
 - `GET /version` — Build metadata (version, commit, build date)
 - `GET /api/stats` — Aggregate DAO statistics (members, loans, proposals, money figures, quarantine count, indexer state)
+- `GET /api/stats/history` — Daily loan principal lent/repaid, defaults, defaulted value, and cumulative default rate (`data` timeseries; money values are decimal strings)
 
 **Members:**
 - `GET /api/members` — Active members list
@@ -339,7 +341,7 @@ Every response's `Cache-Control` comes from one of four **named policies** defin
 
 | Policy | Header | Applies to |
 |---|---|---|
-| `public-live` | `public, max-age=5, must-revalidate` | Tip-of-chain reads: `/members`, `/members/:address`, `/members/:address/activity`, `/proposals/*`, `/loans`, `/loans/:id`, the two `/timeline` routes, `/stats`, and `/events`, `/admin/log`, `/interest`, `/documents` **without** a cursor. |
+| `public-live` | `public, max-age=5, must-revalidate` | Tip-of-chain reads: `/members`, `/members/:address`, `/members/:address/activity`, `/proposals/*`, `/loans`, `/loans/:id`, the two `/timeline` routes, `/stats`, `/stats/history`, and `/events`, `/admin/log`, `/interest`, `/documents` **without** a cursor. |
 | `public-historical` | `public, max-age=31536000, immutable` | `/events` (`?before=`/`?after=`), `/admin/log`, `/interest`, `/documents` with a cursor. |
 | `private` | `private, no-cache` | Member-specific data: `/members/:address/summary`, `/notifications`. Never `public`. |
 | `no-store` | `no-store` | Authentication challenges, `PATCH` mutations, `/health`, `/ready`, `/version`, `/admin/failed-events`, and the `/stream` SSE endpoint. |
@@ -350,11 +352,13 @@ Every response's `Cache-Control` comes from one of four **named policies** defin
 
 ### Reorg detection
 
+> **On-call? Start here:** [`docs/REORG_RECOVERY.md`](./docs/REORG_RECOVERY.md) is the full runbook — how each check below works, diagnostic SQL for the cursor, triage, and the step-by-step recovery procedure.
+
 Stellar's consensus gives fast finality, so a deep reorg is genuinely unlikely — but the indexer now *notices* one rather than silently folding events from a diverged history (issue #23):
 
 - The cursor stores `last_ledger` and `last_ledger_hash` — the hash of that same ledger, fetched by sequence from the RPC (Soroban's `getEvents` exposes no per-event ledger hash, so this is the only way to get one).
 - Each poll checks continuity two ways: if the RPC's reported latest ledger is **below** the last folded ledger, or a fetched page contains an event from a ledger already folded past, the indexer **halts** with a loud log line instead of retrying. It also re-fetches the RPC's current hash for `last_ledger` and compares it against what's stored (issue #128) — this catches a **same-height fork**, where history diverges without the ledger sequence ever moving backwards, which the sequence-only checks can't see. A ledger the RPC has since pruned is treated as unverifiable, not as a fork.
-- **Recovery:** stop the indexer worker (`node dist/worker.js`) and run `npm run reindex` (`node dist/indexer/reindex.js` in the container). It truncates the derived tables and rebuilds them from the raw `events` log in one transaction — the log is authoritative and untouched. A rebuild produces state identical to the incremental fold (asserted by a test), so `reindex` is also the repair path for the historical-data bugs tracked in other issues.
+- **Recovery:** stop the indexer worker (`node dist/worker.js`) and run `npm run reindex` (`node dist/indexer/reindex.js` in the container). It truncates the derived tables and rebuilds them from the raw `events` log in one transaction — the log is authoritative and untouched. A rebuild produces state identical to the incremental fold (asserted by a test), so `reindex` is also the repair path for the historical-data bugs tracked in other issues. The complete diagnosis-and-recovery procedure is the runbook: [`docs/REORG_RECOVERY.md`](./docs/REORG_RECOVERY.md).
 - **Worker serialization (Advisory Lock):** Both `reindex` and the worker's event fold loops acquire a dedicated session-level Postgres advisory lock (`0x0d400001`). If a reindex is attempted while a worker is running or folding, it fails immediately with an actionable error rather than racing to corrupt derived state.
 - **Streaming & Memory Bounds:** The rebuild streams the event log via keyset pagination over `(ledger, id)` in batches (default 1,000) inside a single transaction, keeping Node.js memory flat (~40–60 MB RSS) regardless of event log size (e.g., 100k+ events). Progress is logged periodically with event counts, percentage, throughput (events/s), and estimated ETA.
 - **Rebuild Performance Expectations:**
@@ -430,7 +434,7 @@ Tests apply the real `schema.sql` and truncate all tables between runs (`test/db
 
 MVP — the indexer and read API are implemented for the full event catalog, including loan defaults, with test coverage across every indexer handler and API route. Known gaps:
 
-- Reorg handling is *detection only* — the indexer halts on a ledger discontinuity and an operator rebuilds derived state from the raw log with `npm run reindex` (see [Reorg detection](#reorg-detection)). There is no automatic rollback and replay of orphaned events.
+- Reorg handling is *detection only* — the indexer halts on a ledger discontinuity and an operator rebuilds derived state from the raw log with `npm run reindex` (see [Reorg detection](#reorg-detection) and the runbook in [`docs/REORG_RECOVERY.md`](./docs/REORG_RECOVERY.md)). There is no automatic rollback and replay of orphaned events.
 - Single indexer instance — no leader-election or multi-instance coordination if you wanted to run more than one worker for redundancy.
 - IPFS pinning for document metadata is a frontend/contract-facing concern (`ourdao-frontend`'s `lib/ipfs.ts`) — this service indexes `doc_attn`'s existence/history (`documents`, `GET /api/documents`) but never the content hash or its content.
 

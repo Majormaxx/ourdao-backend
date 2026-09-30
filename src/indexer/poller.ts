@@ -1,13 +1,15 @@
 import type { rpc } from '@stellar/stellar-sdk'
 import type { PoolClient } from 'pg'
-import { config, assertContractConfigured } from '../config.js'
-import { pool, queryOne } from '../db/index.js'
+import { SpanStatusCode } from '@opentelemetry/api'
+import { config, assertContractsConfigured } from '../config.js'
+import { pool, query, queryOne } from '../db/index.js'
 import { server, getLatestLedger, getLatestLedgerInfo, getLedgerHash } from '../stellar/rpc.js'
 import { decodeEvent, type DecodedEvent } from '../stellar/events.js'
 import { applyEvent } from './handlers.js'
 import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
 import { REINDEX_LOCK_KEY } from './reindex.js'
 import { notifyStreamClientsAfterCommit, type StreamChannel } from '../api/stream.js'
+import { getTracer } from '../telemetry.js'
 
 interface CursorRow {
   paging_token: string | null
@@ -62,7 +64,9 @@ export async function resetForContractChange(): Promise<void> {
 
     await client.query(`TRUNCATE ${DERIVED_TABLES.join(', ')} RESTART IDENTITY`)
     await resetDaoTotals(client)
-    await client.query('DELETE FROM indexer_cursor WHERE id = 1')
+    // Issue #289: wipes every tailed contract's cursor row, not just one —
+    // a reset re-indexes everything from scratch, all contracts included.
+    await client.query('DELETE FROM indexer_cursor')
     await client.query('COMMIT')
   } catch (err) {
     try {
@@ -88,43 +92,45 @@ export async function resetForContractChange(): Promise<void> {
  * instead wipes the cursor + derived tables and re-indexes from scratch.
  * No-op when the cursor is absent or already matches.
  */
-export async function ensureCursorContract(contractId: string): Promise<void> {
-  const row = await queryOne<{ contract_id: string | null }>(
-    'SELECT contract_id FROM indexer_cursor WHERE id = 1'
-  )
-  const saved = row?.contract_id ?? null
-  if (saved === null || saved === contractId) return
+export async function ensureCursorContract(contractIds: string[]): Promise<void> {
+  const rows = await query<{ contract_id: string }>('SELECT contract_id FROM indexer_cursor')
+  const configured = new Set(contractIds)
+  // Issue #289: cursor rows are now keyed by contract_id (one per tailed
+  // contract), so there's no longer a single "the" saved contract to compare
+  // against — instead, any row whose contract_id isn't in the currently
+  // configured set means that contract was removed/replaced (a redeploy —
+  // the DAO contract has no upgrade path, see #16) since the last run, and
+  // its derived state must not silently keep being treated as live.
+  const stale = rows.filter((r) => !configured.has(r.contract_id)).map((r) => r.contract_id)
+  if (stale.length === 0) return
 
   if (config.indexer.resetOnContractChange) {
     console.warn(
-      `[indexer] CONTRACT_ID changed (${saved} -> ${contractId}) and ` +
+      `[indexer] configured contract(s) changed (stale: ${stale.join(', ')}; now: ${contractIds.join(', ')}) and ` +
         `INDEXER_RESET_ON_CONTRACT_CHANGE is set: wiping the cursor, derived ` +
-        `tables (${DERIVED_TABLES.join(', ')}), and dao_totals — re-indexing the ` +
-        `new contract from scratch. The raw events log is left intact.`
+        `tables (${DERIVED_TABLES.join(', ')}), and dao_totals — re-indexing from scratch. ` +
+        `The raw events log is left intact.`
     )
     await resetForContractChange()
     return
   }
 
   throw new Error(
-    `Indexer cursor belongs to contract ${saved}, but CONTRACT_ID is now ${contractId}. ` +
-      `Resuming would merge two deployments' derived state in one database. ` +
-      `To repoint at a new deployment: start once with INDEXER_RESET_ON_CONTRACT_CHANGE=true ` +
-      `to wipe the cursor and derived tables, or point DATABASE_URL at a fresh database. ` +
-      `See the README's "Redeploying the contract" section.`
+    `Indexer cursor has row(s) for contract(s) no longer configured: ${stale.join(', ')} ` +
+      `(configured: ${contractIds.join(', ')}). Resuming would merge a stale deployment's derived ` +
+      `state with a new one. To repoint at a new deployment: start once with ` +
+      `INDEXER_RESET_ON_CONTRACT_CHANGE=true to wipe the cursor and derived tables, or point ` +
+      `DATABASE_URL at a fresh database. See the README's "Redeploying the contract" section.`
   )
 }
 
-/** Loads the saved cursor, but only if it belongs to `contractId` — a
- *  cursor saved under a different contract (CONTRACT_ID changed since the
- *  last run) is treated as absent so the indexer cold-starts instead of
- *  resuming with another contract's paging_token. */
+/** Loads the saved cursor for `contractId`, or null if this contract has
+ *  never been polled before (cold start). */
 async function loadCursor(contractId: string): Promise<CursorRow | null> {
-  const row = await queryOne<CursorRow>(
-    'SELECT paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id FROM indexer_cursor WHERE id = 1'
+  return queryOne<CursorRow>(
+    'SELECT paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id FROM indexer_cursor WHERE contract_id = $1',
+    [contractId]
   )
-  if (row && row.contract_id != null && row.contract_id !== contractId) return null
-  return row
 }
 
 // Issue #173: saveCursor can fail on its own after folding succeeds. Track
@@ -151,9 +157,9 @@ async function saveCursor(
 ): Promise<void> {
   try {
     await pool.query(
-      `INSERT INTO indexer_cursor (id, paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id, updated_at)
-       VALUES (1, $1, $2, $3, $4, $5, now())
-       ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, observed_tip_ledger = $4, contract_id = $5, updated_at = now()`,
+      `INSERT INTO indexer_cursor (paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id, updated_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (contract_id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, observed_tip_ledger = $4, updated_at = now()`,
       [pagingToken, lastLedger, lastLedgerHash, observedTipLedger, contractId]
     )
     // Clear any prior cursor write failure now that this one succeeded
@@ -168,8 +174,8 @@ async function saveCursor(
 }
 
 /** Touch updated_at without changing data — keeps freshness signal alive on idle contracts. */
-async function touchCursor(): Promise<void> {
-  await pool.query('UPDATE indexer_cursor SET updated_at = now() WHERE id = 1')
+async function touchCursor(contractId: string): Promise<void> {
+  await pool.query('UPDATE indexer_cursor SET updated_at = now() WHERE contract_id = $1', [contractId])
 }
 
 /** Determine the ledger to start from on a cold start (no saved cursor). */
@@ -635,7 +641,25 @@ export async function fetchOnce(contractId: string): Promise<void> {
     const events = res.events ?? []
     const pageCount = events.length
 
-    await ingestPageWithQuarantine(events, lastLedger)
+    // Issue #288: one span per drained page/event-batch, distinct from
+    // applyEvent's per-event spans in handlers.ts — this is the unit
+    // ingestPageWithQuarantine itself operates on (a whole-page transaction,
+    // or one transaction per event once quarantining kicks in).
+    await getTracer().startActiveSpan('indexer.page', async (span) => {
+      span.setAttribute('page.contract_id', contractId)
+      span.setAttribute('page.number', totalPages + 1)
+      span.setAttribute('page.event_count', pageCount)
+      span.setAttribute('page.last_folded_ledger', lastLedger)
+      try {
+        await ingestPageWithQuarantine(events, lastLedger)
+      } catch (err) {
+        span.recordException(err instanceof Error ? err : String(err))
+        span.setStatus({ code: SpanStatusCode.ERROR })
+        throw err
+      } finally {
+        span.end()
+      }
+    })
     totalPages += 1
     totalEvents += pageCount
 
@@ -693,7 +717,7 @@ export async function fetchOnce(contractId: string): Promise<void> {
   // the observed tip/cursor didn't move either), touch updated_at so /ready
   // doesn't falsely report stale (issue #2 context note).
   if (totalEvents === 0 && !cursorWritten) {
-    await touchCursor()
+    await touchCursor(contractId)
   } else if (totalPages > 1) {
     console.log(`[indexer] drain complete: ${totalPages} pages, ${totalEvents} events in ${Date.now() - drainStart}ms`)
   }
@@ -736,40 +760,63 @@ export async function runIndexer(): Promise<void> {
   running = true
   abortController = new AbortController()
 
-  const contractId = assertContractConfigured()
-  await ensureCursorContract(contractId)
-  console.log(`[indexer] watching ${contractId} on ${config.stellar.rpcUrl}`)
-  let consecutiveFailures = 0
+  // Issue #289: one indexer process can now tail several contracts at once.
+  // Each gets its own cursor row (see the migration + loadCursor/saveCursor
+  // above) and its own failure/backoff state below, so one contract's RPC
+  // trouble doesn't slow down or reset backoff for a healthy one; they're
+  // still polled from a single loop (not one task per contract) to keep the
+  // existing shutdown/abort-signal handling simple and centralized.
+  const contractIds = assertContractsConfigured()
+  await ensureCursorContract(contractIds)
+  console.log(`[indexer] watching ${contractIds.length} contract(s) on ${config.stellar.rpcUrl}: ${contractIds.join(', ')}`)
+
+  const consecutiveFailures = new Map<string, number>()
+  const nextPollAt = new Map<string, number>(contractIds.map((id) => [id, 0]))
+  // How often the loop wakes to check which contracts are due. A single
+  // shared POLL_INTERVAL_MS/POLL_MAX_BACKOFF_MS config applies to every
+  // tailed contract; only each contract's own consecutive-failure count
+  // (tracked per contract above) differs.
+  const tickMs = config.indexer.pollIntervalMs
+
   try {
     while (!abortController.signal.aborted) {
-      let delay = config.indexer.pollIntervalMs
-      try {
-        await fetchOnce(contractId)
-        consecutiveFailures = 0
-      } catch (err) {
-        // A ledger discontinuity is not a transient error — retrying would
-        // fold events from a diverged history. Halt loudly (issue #23).
-        if (err instanceof ReorgDetectedError) {
-          console.error(`[indexer] LEDGER DISCONTINUITY DETECTED — halting the indexer. ${err.message}`)
-          console.error(
-            `[indexer] Recovery: confirm the true chain state, then run \`npm run reindex\` to rebuild ` +
-              `the derived tables from the raw events log. See README "Reorg detection".`
+      const now = Date.now()
+      for (const contractId of contractIds) {
+        if (abortController.signal.aborted) break
+        if ((nextPollAt.get(contractId) ?? 0) > now) continue
+
+        let delay = config.indexer.pollIntervalMs
+        try {
+          await fetchOnce(contractId)
+          consecutiveFailures.set(contractId, 0)
+        } catch (err) {
+          // A ledger discontinuity is not a transient error — retrying would
+          // fold events from a diverged history. Halt loudly (issue #23),
+          // for every tailed contract, not just the one that hit it.
+          if (err instanceof ReorgDetectedError) {
+            console.error(`[indexer] LEDGER DISCONTINUITY DETECTED on ${contractId} — halting the indexer. ${err.message}`)
+            console.error(
+              `[indexer] Recovery: confirm the true chain state, then run \`npm run reindex\` to rebuild ` +
+                `the derived tables from the raw events log. See README "Reorg detection".`
+            )
+            // Reorg halt is deliberate and permanent for this run — don't
+            // reset, so the caller must explicitly restart (issue #48).
+            throw err
+          }
+          const msg = err instanceof Error ? err.message : String(err)
+          const failures = (consecutiveFailures.get(contractId) ?? 0) + 1
+          consecutiveFailures.set(contractId, failures)
+          delay = Math.min(
+            config.indexer.pollIntervalMs * 2 ** failures,
+            config.indexer.maxBackoffMs
           )
-          // Reorg halt is deliberate and permanent for this run — don't
-          // reset, so the caller must explicitly restart (issue #48).
-          throw err
+          console.error(
+            `[indexer] poll error on ${contractId} (${failures} consecutive): ${msg} — retrying in ${delay}ms`
+          )
         }
-        const msg = err instanceof Error ? err.message : String(err)
-        consecutiveFailures += 1
-        delay = Math.min(
-          config.indexer.pollIntervalMs * 2 ** consecutiveFailures,
-          config.indexer.maxBackoffMs
-        )
-        console.error(
-          `[indexer] poll error (${consecutiveFailures} consecutive): ${msg} — retrying in ${delay}ms`
-        )
+        nextPollAt.set(contractId, Date.now() + delay)
       }
-      await sleep(delay, abortController.signal)
+      await sleep(tickMs, abortController.signal)
     }
   } finally {
     running = false

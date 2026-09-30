@@ -19,7 +19,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Indexer resume state (single row, id = 1).
+-- Indexer resume state — one row per tailed contract, primary-keyed on
+-- contract_id (issue #289: multi-contract tailing needs an independent
+-- cursor per contract; a pre-#289 single-contract deployment just has one
+-- row here). `id` survives only as a vestigial nullable column so any
+-- database that predates #289 doesn't need it dropped by hand; it's never
+-- read or written by current code.
 -- `last_ledger_hash` is the hash of `last_ledger` itself — the ledger
 -- actually folded to (issue #127) — fetched by sequence from the RPC
 -- (Soroban getEvents exposes no per-event hash). Re-checked against the
@@ -32,14 +37,13 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 -- getEvents page must never advance `last_ledger` from this value; see
 -- README "Reorg detection" and src/indexer/poller.ts.
 CREATE TABLE IF NOT EXISTS indexer_cursor (
-  id                  SMALLINT PRIMARY KEY DEFAULT 1,
+  id                  SMALLINT,
   paging_token        TEXT,
   last_ledger         BIGINT,
   last_ledger_hash    TEXT,
   observed_tip_ledger BIGINT,
-  contract_id         TEXT,
-  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT indexer_cursor_singleton CHECK (id = 1)
+  contract_id         TEXT PRIMARY KEY,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Raw event log — the append-only source every derived table is built from.
@@ -189,6 +193,17 @@ CREATE TABLE IF NOT EXISTS dao_totals (
 );
 INSERT INTO dao_totals (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 
+-- Daily loan chart aggregates, updated in the same transaction as each
+-- lifecycle event and rebuilt from the raw event log during reindex.
+CREATE TABLE IF NOT EXISTS daily_loan_stats (
+  day                 DATE PRIMARY KEY,
+  loans_originated    INTEGER NOT NULL DEFAULT 0,
+  principal_lent      NUMERIC(40,0) NOT NULL DEFAULT 0,
+  principal_repaid    NUMERIC(40,0) NOT NULL DEFAULT 0,
+  defaults_count      INTEGER NOT NULL DEFAULT 0,
+  value_defaulted     NUMERIC(40,0) NOT NULL DEFAULT 0
+);
+
 -- One row per `interest` event: the distribution history (issue #24).
 -- `event_id` is the raw events.id and is UNIQUE so a re-delivered event
 -- folds exactly once.
@@ -296,3 +311,25 @@ CREATE TABLE IF NOT EXISTS auth_nonces (
 );
 CREATE INDEX IF NOT EXISTS auth_nonces_expires_at_idx ON auth_nonces (expires_at);
 CREATE INDEX IF NOT EXISTS auth_nonces_address_idx ON auth_nonces (address);
+
+-- Immutable audit trail for administrative actions (issue #291): resolving
+-- quarantined events, resetting cursors, manual reindexing. Rows are never
+-- updated or deleted — append-only so the trail is tamper-evident.
+-- `admin_address` is the authenticated Stellar address that performed the action.
+-- `action` is a short machine-readable label (e.g. 'resolve_quarantined_event').
+-- `ip_address` is the originating IP as seen by the API (trust level depends on
+--   TRUST_PROXY configuration).
+-- `payload` stores action-specific context as JSONB so the schema is stable as
+--   new action types are added.
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+  id            BIGSERIAL PRIMARY KEY,
+  admin_address TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  ip_address    TEXT,
+  payload       JSONB NOT NULL DEFAULT '{}',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS admin_audit_log_admin_address_idx ON admin_audit_log (admin_address, created_at DESC);
+CREATE INDEX IF NOT EXISTS admin_audit_log_action_idx ON admin_audit_log (action, created_at DESC);
+CREATE INDEX IF NOT EXISTS admin_audit_log_created_at_idx ON admin_audit_log (created_at DESC);

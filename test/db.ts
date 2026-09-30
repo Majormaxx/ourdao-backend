@@ -28,6 +28,7 @@ const NON_DERIVED_TABLES = [
   'indexer_cursor',
   'failed_events',
   'quarantine_state',
+  'admin_audit_log',
 ]
 
 export async function resetDb(): Promise<void> {

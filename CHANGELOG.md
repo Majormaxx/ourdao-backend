@@ -27,6 +27,7 @@ Entries that affect deployment or runtime state are annotated:
 - **Mutation Testing**: Evaluated and configured Stryker for high-risk modules `src/indexer/handlers.ts` and `src/api/errors.ts` (#209).
 - **Soroban RPC Response Shape Smoke Test**: Added opt-in scheduled smoke test verifying real RPC wire response compatibility without mocking, pinned to SDK version 16.0.1 (#206).
 - **Changelog & Versioning**: Established `CHANGELOG.md`, versioning policy, and deployment tracking (#213).
+- **Reorg recovery runbook**: `docs/REORG_RECOVERY.md` — how the indexer detects a ledger discontinuity, the `indexer_cursor` fields involved (`last_ledger`, `last_ledger_hash`, `observed_tip_ledger`), diagnostic SQL for cursor state, triage, and the step-by-step operator recovery. Linked from the README's Reorg detection section and `docs/DEPLOYMENT.md` (#297).
 
 
 ### Fixed

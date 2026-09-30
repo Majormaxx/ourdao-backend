@@ -205,7 +205,7 @@ describe('indexer: ledger discontinuity detection (issue #23)', () => {
     await query(
       `INSERT INTO indexer_cursor (id, paging_token, last_ledger, contract_id)
        VALUES (1, 'tok', 500, 'CTESTCONTRACT')
-       ON CONFLICT (id) DO UPDATE SET paging_token = 'tok', last_ledger = 500, contract_id = 'CTESTCONTRACT'`
+       ON CONFLICT (contract_id) DO UPDATE SET paging_token = 'tok', last_ledger = 500, contract_id = 'CTESTCONTRACT'`
     )
     await expect(fetchOnce('CTESTCONTRACT')).rejects.toBeInstanceOf(ReorgDetectedError)
   })

@@ -62,6 +62,14 @@ jobs:
       - name: License check
         run: npm run license:check
 
+      # Issue #290: verify all migrations in src/db/migrations/ apply cleanly
+      # to a fresh database and produce a schema matching src/db/schema.sql,
+      # and assert no duplicate migration version IDs exist. Runs as a
+      # distinct step so failures are attributable at a glance before the
+      # full coverage gate runs.
+      - name: Migration dry-run verification
+        run: npm run test -- --reporter=verbose test/migration-dry-run.test.ts
+
       # Runs the full suite with v8 coverage instrumentation and enforces the
       # thresholds in vitest.config.ts (#79). Replaces the plain `npm test`
       # step — same tests, plus the report. Observed runtime delta on CI: a

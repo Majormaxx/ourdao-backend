@@ -11,6 +11,7 @@ export const DERIVED_TABLES = [
   'treasury_proposals',
   'notifications',
   'interest_distributions',
+  'daily_loan_stats',
   'documents',
 ] as const
 

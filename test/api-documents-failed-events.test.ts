@@ -239,3 +239,118 @@ describe('API: GET /api/admin/failed-events (issue #43)', () => {
     expect(body.events[0].id).toBe('1-0')
   })
 })
+
+describe('API: POST /api/admin/failed-events/batch-resolve (issue #287)', () => {
+  let app: FastifyInstance
+
+  beforeEach(async () => {
+    await resetDb()
+    app = await buildServer()
+    await app.ready()
+  })
+  afterAll(closeDb)
+
+  async function insertFailedEvents(n: number): Promise<number[]> {
+    const rows = await query<{ id: number }>(
+      `INSERT INTO failed_events (event_id, symbol, ledger, error)
+       SELECT g::text || '-0', 'loan_dflt', g, 'boom-' || g
+         FROM generate_series(1, $1) AS g
+       RETURNING id`,
+      [n]
+    )
+    return rows.map((r) => r.id)
+  }
+
+  it('resolves a batch of unresolved events in one call and returns the count', async () => {
+    const ids = await insertFailedEvents(3)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      payload: { ids, resolution: 'resolved', note: 'reindexed and confirmed clean' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 3 })
+
+    const rows = await query<{ resolution: string; resolution_note: string; resolved_at: string | null }>(
+      `SELECT resolution, resolution_note, resolved_at FROM failed_events WHERE id = ANY($1) ORDER BY id`,
+      [ids]
+    )
+    expect(rows).toHaveLength(3)
+    for (const row of rows) {
+      expect(row.resolution).toBe('resolved')
+      expect(row.resolution_note).toBe('reindexed and confirmed clean')
+      expect(row.resolved_at).not.toBeNull()
+    }
+  })
+
+  it('accepts "ignored" as a resolution with no note', async () => {
+    const ids = await insertFailedEvents(1)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      payload: { ids, resolution: 'ignored' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 1 })
+    const row = await query<{ resolution: string; resolution_note: string | null }>(
+      `SELECT resolution, resolution_note FROM failed_events WHERE id = $1`,
+      [ids[0]]
+    )
+    expect(row[0].resolution).toBe('ignored')
+    expect(row[0].resolution_note).toBeNull()
+  })
+
+  it('excludes an already-resolved id from the count rather than erroring the batch', async () => {
+    const ids = await insertFailedEvents(2)
+    await query(`UPDATE failed_events SET resolved_at = now() WHERE id = $1`, [ids[0]])
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      payload: { ids, resolution: 'resolved' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 1 })
+  })
+
+  it('rejects an empty or missing ids array', async () => {
+    for (const payload of [{ ids: [], resolution: 'resolved' }, { resolution: 'resolved' }]) {
+      const res = await app.inject({ method: 'POST', url: '/api/admin/failed-events/batch-resolve', payload })
+      expect(res.statusCode).toBe(400)
+    }
+  })
+
+  it('rejects a non-integer or negative id', async () => {
+    for (const ids of [[1.5], [-1], ['1']]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/failed-events/batch-resolve',
+        payload: { ids, resolution: 'resolved' },
+      })
+      expect(res.statusCode).toBe(400)
+    }
+  })
+
+  it('rejects a resolution outside resolved/ignored', async () => {
+    const ids = await insertFailedEvents(1)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      payload: { ids, resolution: 'archived' },
+    })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('is atomic: applies to all matched rows or none', async () => {
+    const ids = await insertFailedEvents(5)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      payload: { ids, resolution: 'resolved' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 5 })
+    const stillUnresolved = await query(`SELECT id FROM failed_events WHERE resolved_at IS NULL`)
+    expect(stillUnresolved).toHaveLength(0)
+  })
+})

@@ -15,27 +15,33 @@ describe('indexer: contract repoint guard', () => {
 
   async function seedCursor(contractId: string): Promise<void> {
     await pool.query(
-      `INSERT INTO indexer_cursor (id, paging_token, last_ledger, contract_id)
-       VALUES (1, 'tok', 42, $1)
-       ON CONFLICT (id) DO UPDATE SET contract_id = $1`,
+      `INSERT INTO indexer_cursor (paging_token, last_ledger, contract_id)
+       VALUES ('tok', 42, $1)
+       ON CONFLICT (contract_id) DO UPDATE SET contract_id = $1`,
       [contractId]
     )
   }
 
-  it('refuses to start when the saved cursor belongs to a different contract', async () => {
+  it('refuses to start when the saved cursor has a row for a contract no longer configured', async () => {
     await seedCursor('COLDCONTRACT')
-    await expect(ensureCursorContract('CNEWCONTRACT')).rejects.toThrow(/belongs to contract COLDCONTRACT/)
+    await expect(ensureCursorContract(['CNEWCONTRACT'])).rejects.toThrow(/row\(s\) for contract\(s\) no longer configured: COLDCONTRACT/)
   })
 
   it('is a no-op when the cursor matches the configured contract', async () => {
     await seedCursor('CSAME')
-    await expect(ensureCursorContract('CSAME')).resolves.toBeUndefined()
-    const rows = await query('SELECT * FROM indexer_cursor WHERE id = 1')
+    await expect(ensureCursorContract(['CSAME'])).resolves.toBeUndefined()
+    const rows = await query('SELECT * FROM indexer_cursor WHERE contract_id = $1', ['CSAME'])
     expect(rows).toHaveLength(1)
   })
 
   it('is a no-op on a cold start with no saved cursor', async () => {
-    await expect(ensureCursorContract('CANYTHING')).resolves.toBeUndefined()
+    await expect(ensureCursorContract(['CANYTHING'])).resolves.toBeUndefined()
+  })
+
+  it('is a no-op when every saved row is still configured, across multiple contracts', async () => {
+    await seedCursor('CONE')
+    await seedCursor('CTWO')
+    await expect(ensureCursorContract(['CONE', 'CTWO'])).resolves.toBeUndefined()
   })
 
   it('resetForContractChange clears the cursor and all derived tables but keeps the raw events log', async () => {
