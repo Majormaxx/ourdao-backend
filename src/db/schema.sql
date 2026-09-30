@@ -288,6 +288,24 @@ CREATE TABLE IF NOT EXISTS quarantine_state (
 );
 CREATE INDEX IF NOT EXISTS quarantine_state_escalated_at_idx ON quarantine_state (escalated_at);
 
+-- A detected ledger discontinuity (issue #191). One row per halt. The latest
+-- row with `cleared_at IS NULL` stops the worker from resuming (an automatic
+-- restart must not fold past diverged history) and is surfaced by `/ready`
+-- (`reason: reorg_detected`) and `/api/stats.reorgHalt` until an operator
+-- clears it: `npm run reindex` clears it as part of the rebuild, and
+-- `npm run reorg:clear` acknowledges a false alarm without rebuilding.
+CREATE TABLE IF NOT EXISTS reorg_halts (
+  id               BIGSERIAL PRIMARY KEY,
+  contract_id      TEXT NOT NULL,
+  last_ledger      BIGINT,
+  last_ledger_hash TEXT,
+  detail           TEXT NOT NULL,
+  detected_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  cleared_at       TIMESTAMPTZ,
+  cleared_by       TEXT
+);
+CREATE INDEX IF NOT EXISTS reorg_halts_uncleared_idx ON reorg_halts (id DESC) WHERE cleared_at IS NULL;
+
 -- One row per `doc_attn` event (issue #44): the existence and history of a
 -- proposal's attached documents, not the content hash itself (that's read
 -- live from the contract via get_document — see the README's Event catalog).

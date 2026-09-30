@@ -168,6 +168,13 @@ export async function reindexFromEventLog(options?: ReindexOptions): Promise<{ e
     // failed and why) survives, but stop counting it as a live problem.
     await client.query(`UPDATE failed_events SET resolved_at = now() WHERE resolved_at IS NULL`)
 
+    // Issue #191: a completed rebuild is the recovery from a detected
+    // discontinuity, so clear the recorded halt in the same transaction —
+    // the worker may resume as soon as this commits, and not before.
+    await client.query(
+      `UPDATE reorg_halts SET cleared_at = now(), cleared_by = 'reindex' WHERE cleared_at IS NULL`
+    )
+
     await client.query('COMMIT')
   } catch (err) {
     if (lockAcquired) {

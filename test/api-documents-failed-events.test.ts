@@ -99,7 +99,7 @@ describe('API: GET /api/documents listing without a proposal (issue #189)', () =
     expect(ledgers(first.json())).toEqual([400, 300])
     const next = await app.inject({ method: 'GET', url: '/api/documents?limit=2&before=300' })
     expect(ledgers(next.json())).toEqual([200, 100])
-    expect(next.headers['cache-control']).toContain('immutable')
+    expect(next.headers['cache-control']).toBe('public, max-age=3600, must-revalidate')
   })
 
   it("filters by caller — a member's attachment history", async () => {
