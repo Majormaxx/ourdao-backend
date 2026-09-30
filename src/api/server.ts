@@ -15,6 +15,8 @@ import { MemoryNonceStore, PostgresNonceStore, type NonceStore } from '../auth.j
 import { readFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { fileURLToPath } from 'url'
+import { server as rpcServer } from '../stellar/rpc.js'
+import { metricsRegistry } from './metrics.js'
 
 interface CursorRow {
   last_ledger: number | null
@@ -166,7 +168,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     keyGenerator: (req: { ip?: string; socket?: { remoteAddress?: string } }) => req.ip ?? req.socket?.remoteAddress ?? 'unknown',
     addHeadersOnExceeding: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true },
     addHeaders: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true, 'retry-after': true },
-    allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready' || req.url === '/version',
+    allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready' || req.url === '/version' || req.url === '/metrics',
   })
 
   // ── Routes (including /api/stream — issue #158) ──
@@ -175,12 +177,64 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // ── Liveness probe (issue #2) — no DB round trip ──
   app.get('/health', async () => ({ status: 'ok', contract: config.stellar.contractId || null }))
 
+  // ── Dependency health indicators (issue #276) ──
+  // Separate from `/health` (liveness — deliberately no DB round trip) and
+  // `/ready` (a binary pass/fail probe for orchestrators). This endpoint is
+  // for dashboards/alerting: it reports Postgres and Soroban RPC status
+  // individually rather than collapsing them into one ready/not-ready bit,
+  // so an operator can tell which dependency is degraded at a glance. Always
+  // returns 200 — a dependency being down is reported in its own `status`
+  // field, not via the HTTP status code.
+  app.get('/health/dependencies', async () => {
+    const timeout = (ms: number) =>
+      new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error('timed out')), ms)
+      })
+
+    const [postgres, rpc] = await Promise.all([
+      (async () => {
+        const startedAt = Date.now()
+        try {
+          await Promise.race([pool.query('SELECT 1'), timeout(config.http.readyCheckTimeoutMs)])
+          return { status: 'ok' as const, latencyMs: Date.now() - startedAt }
+        } catch (error) {
+          return {
+            status: 'error' as const,
+            latencyMs: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+      })(),
+      (async () => {
+        const startedAt = Date.now()
+        try {
+          const health = await Promise.race([rpcServer.getHealth(), timeout(config.http.readyCheckTimeoutMs)]) as { status: string }
+          return { status: health.status === 'healthy' ? ('ok' as const) : ('degraded' as const), latencyMs: Date.now() - startedAt }
+        } catch (error) {
+          return {
+            status: 'error' as const,
+            latencyMs: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : String(error),
+          }
+        }
+      })(),
+    ])
+
+    return { postgres, rpc }
+  })
+
   // ── Version endpoint (issue #64) — build metadata ──
   app.get('/version', async () => ({
     version: packageVersionResult.version,
     commit: process.env.SOURCE_COMMIT ?? 'unknown',
     buildDate: process.env.BUILD_DATE ?? 'unknown',
   }))
+
+  // ── Prometheus metrics (issue #274) — SSE connection count + message throughput ──
+  app.get('/metrics', async (_req, reply) => {
+    reply.header('Content-Type', metricsRegistry.contentType)
+    return metricsRegistry.metrics()
+  })
 
   // ── Readiness probe (issue #2) — checks DB + indexer freshness ──
   app.get('/ready', async (_req, reply) => {

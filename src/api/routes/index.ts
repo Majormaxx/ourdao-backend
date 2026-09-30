@@ -423,7 +423,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     return { timeline: await entityTimeline(TREASURY_TIMELINE_SYMBOLS, id) }
   })
 
-  // --- Notifications for an address ---
+  // --- Notifications for an address (optional ?before=<id> cursor) ---
   app.get('/notifications', async (req, reply) => {
     setCachePolicy(reply, 'private')
     const q = req.query as Record<string, unknown>
@@ -432,9 +432,19 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     }
     if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+
+    const conditions = ['address = $1']
+    const params: unknown[] = [q.address]
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`id < $${params.length}`)
+    }
+    params.push(l)
     return query<NotificationRow>(
-      'SELECT * FROM notifications WHERE address = $1 ORDER BY id DESC LIMIT $2',
-      [q.address, l]
+      `SELECT * FROM notifications WHERE ${conditions.join(' AND ')} ORDER BY id DESC LIMIT $${params.length}`,
+      params
     )
   })
 
@@ -758,6 +768,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       total_defaulted_value: string | null
       total_treasury_proposals: string
       total_staked: string | null
+      total_contribution: string | null
       interest_collected: string | null
       principal_lent: string | null
       principal_repaid: string | null
@@ -785,6 +796,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
          (SELECT COALESCE(sum(outstanding), 0) FROM loans WHERE status = 'defaulted') AS total_defaulted_value,
          (SELECT count(*) FROM treasury_proposals)                                 AS total_treasury_proposals,
          (SELECT COALESCE(sum(stake), 0) FROM members WHERE exited = false)         AS total_staked,
+         (SELECT COALESCE(sum(contribution), 0) FROM members WHERE exited = false)  AS total_contribution,
          (SELECT interest_collected FROM dao_totals WHERE id = 1)                  AS interest_collected,
          (SELECT principal_lent     FROM dao_totals WHERE id = 1)                  AS principal_lent,
          (SELECT principal_repaid   FROM dao_totals WHERE id = 1)                  AS principal_repaid,
@@ -823,6 +835,15 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       totalDefaultedValue: String(row?.total_defaulted_value ?? '0'),
       totalTreasuryProposals: Number(row?.total_treasury_proposals ?? 0),
       totalStaked: String(row?.total_staked ?? '0'),
+      totalContribution: String(row?.total_contribution ?? '0'),
+      // Issue #281: guard the zero-contribution case explicitly rather than
+      // relying on Number(0n)/Number(0n) — that's NaN, which would silently
+      // become `null` over JSON and break any dashboard doing arithmetic on it.
+      stakingRatio: (() => {
+        const staked = BigInt(row?.total_staked ?? '0')
+        const contribution = BigInt(row?.total_contribution ?? '0')
+        return contribution === 0n ? 0 : Number(staked) / Number(contribution)
+      })(),
       interestCollected: String(row?.interest_collected ?? '0'),
       principalLent: String(row?.principal_lent ?? '0'),
       principalRepaid: String(row?.principal_repaid ?? '0'),

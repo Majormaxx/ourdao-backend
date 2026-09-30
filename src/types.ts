@@ -201,6 +201,13 @@ export interface DAOStats {
   totalDefaultedValue: string
   totalTreasuryProposals: number
   totalStaked: string
+  // Issue #281: what fraction of active members' total contributed capital
+  // is currently staked — `totalStaked / totalContribution` over non-exited
+  // members, as a plain 0..1 ratio (0 when there is no contribution to
+  // divide by). `totalContribution` is exposed alongside it so a client
+  // doesn't have to re-derive the denominator to show both figures.
+  totalContribution: string
+  stakingRatio: number
   // Lifetime money figures (issue #24), as decimal strings like every other
   // on-chain amount. `interestCollected` is interest the treasury took in;
   // the amount actually credited to members is slightly less because the

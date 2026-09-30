@@ -40,8 +40,8 @@ describe('API: proposals, stats, events, admin/log', () => {
     // should be excluded from totalStaked (issue #13). GPHANTOM: a row with
     // no join event (e.g. from name_reg) that must count for nothing (#14).
     await query(
-      `INSERT INTO members (address, joined_ledger, exited, stake) VALUES
-       ('GA', 10, false, 100), ('GB', 20, true, 50), ('GPHANTOM', NULL, false, 0)`
+      `INSERT INTO members (address, joined_ledger, exited, stake, contribution) VALUES
+       ('GA', 10, false, 100, 400), ('GB', 20, true, 50, 200), ('GPHANTOM', NULL, false, 0, 0)`
     )
     await query(`INSERT INTO loan_proposals (id, borrower, amount) VALUES (1, 'GA', 100)`)
     await query(
@@ -78,6 +78,10 @@ describe('API: proposals, stats, events, admin/log', () => {
     expect(body.totalTreasuryProposals).toBe(1)
     // Only GA's stake — GB exited, so their stale 50 is excluded.
     expect(body.totalStaked).toBe('100')
+    // Issue #281: staking ratio over active members only — GA's 100 staked
+    // out of GA's 400 contribution (GB and GPHANTOM excluded, same as totalStaked).
+    expect(body.totalContribution).toBe('400')
+    expect(body.stakingRatio).toBeCloseTo(0.25)
     expect(body.lastIndexedLedger).toBe(999)
     // Issue #45: the folded high-water mark and the RPC-observed tip are
     // reported separately rather than conflated into one column.

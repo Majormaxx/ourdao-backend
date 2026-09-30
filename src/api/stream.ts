@@ -4,6 +4,7 @@ import { config } from '../config.js'
 import { createDedicatedClient, pool } from '../db/index.js'
 import { logger } from '../logger.js'
 import { setCachePolicy } from './cache-policy.js'
+import { sseConnectionsGauge, sseConnectionsTotal, sseMessagesTotal } from './metrics.js'
 
 /**
  * Server-Sent Events stream for real-time updates (issue #63).
@@ -112,6 +113,7 @@ export function getConnectedStreamCount(): number {
 export function resetConnectedStreamsForTests(): void {
   connectedClients.clear()
   connectionsByIp.clear()
+  sseConnectionsGauge.set(0)
 }
 
 /**
@@ -455,6 +457,7 @@ export class StreamClient {
     // one write() return value governs this whole frame's backpressure.
     const frame = `event: ${eventType}\nid: ${id}\ndata: ${data}\n\n`
 
+    sseMessagesTotal.inc({ event_type: eventType })
     if (this.paused) {
       this.enqueue(frame)
       return
@@ -543,6 +546,7 @@ export class StreamClient {
       const n = connectionsByIp.get(this.ip) ?? 0
       if (n <= 1) connectionsByIp.delete(this.ip)
       else connectionsByIp.set(this.ip, n - 1)
+      sseConnectionsGauge.set(connectedClients.size)
     }
 
     // End the response
@@ -632,6 +636,8 @@ export async function registerStreamEndpoint(app: FastifyInstance): Promise<void
       streamClient = new StreamClient(reply, ip)
       connectedClients.add(streamClient)
       connectionsByIp.set(ip, ipCount + 1)
+      sseConnectionsGauge.set(connectedClients.size)
+      sseConnectionsTotal.inc()
 
       // Issue #159: register handlers only after streamClient is assigned, as
       // synchronous wrappers that attach .catch() — EventEmitter ignores the
