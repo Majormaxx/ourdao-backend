@@ -112,7 +112,7 @@ export async function resetForContractChange(): Promise<void> {
     // or ROLLBACK — no explicit unlock is needed, preventing leaks on crash.
     await client.query('BEGIN')
     const lockRes = await client.query<{ pg_try_advisory_xact_lock: boolean }>(
-      'SELECT pg_try_advisory_xact_lock($1)',
+      'SELECT pg_try_advisory_xact_lock($1, hashtext(current_schema()))',
       [REINDEX_LOCK_KEY]
     )
     if (!lockRes.rows[0]?.pg_try_advisory_xact_lock) {
@@ -319,7 +319,7 @@ async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): 
   const pendingNotifications: { channel: StreamChannel; ev: DecodedEvent }[] = []
   try {
     const lockRes = await client.query<{ pg_try_advisory_lock: boolean }>(
-      'SELECT pg_try_advisory_lock($1)',
+      'SELECT pg_try_advisory_lock($1, hashtext(current_schema()))',
       [REINDEX_LOCK_KEY]
     )
     if (!lockRes.rows[0]?.pg_try_advisory_lock) {
@@ -367,7 +367,7 @@ async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): 
   } finally {
     if (lockAcquired) {
       try {
-        await client.query('SELECT pg_advisory_unlock($1)', [REINDEX_LOCK_KEY])
+        await client.query('SELECT pg_advisory_unlock($1, hashtext(current_schema()))', [REINDEX_LOCK_KEY])
       } catch (err) {
         console.error('[indexer] failed to release advisory lock:', err)
       }
@@ -478,7 +478,7 @@ async function ingestEventQuarantined(ev: DecodedEvent, lastLedger: number): Pro
   let committedChannel: StreamChannel | undefined
   try {
     const lockRes = await client.query<{ pg_try_advisory_lock: boolean }>(
-      'SELECT pg_try_advisory_lock($1)',
+      'SELECT pg_try_advisory_lock($1, hashtext(current_schema()))',
       [REINDEX_LOCK_KEY]
     )
     if (!lockRes.rows[0]?.pg_try_advisory_lock) {
@@ -504,7 +504,7 @@ async function ingestEventQuarantined(ev: DecodedEvent, lastLedger: number): Pro
   } finally {
     if (lockAcquired) {
       try {
-        await client.query('SELECT pg_advisory_unlock($1)', [REINDEX_LOCK_KEY])
+        await client.query('SELECT pg_advisory_unlock($1, hashtext(current_schema()))', [REINDEX_LOCK_KEY])
       } catch (err) {
         console.error('[indexer] failed to release advisory lock:', err)
       }

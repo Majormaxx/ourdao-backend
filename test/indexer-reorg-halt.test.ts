@@ -36,6 +36,7 @@ const {
   recordReorgHalt,
 } = await import('../src/indexer/poller.js')
 const { reindexFromEventLog } = await import('../src/indexer/reindex.js')
+const { clearRecordedReorg } = await import('../src/indexer/clear-reorg.js')
 
 const CONTRACT = 'CTESTREORG'
 
@@ -125,6 +126,31 @@ describe('indexer: a detected reorg is recorded and blocks resumption (issue #19
       ['first', 'operator'],
       ['second', 'operator'],
     ])
+  })
+
+  it('records a halt even when no cursor row exists, and the refusal says the ledger is unknown', async () => {
+    await query('DELETE FROM indexer_cursor')
+    await recordReorgHalt(CONTRACT, new ReorgDetectedError('no cursor yet'))
+    const open = await loadUnclearedReorgHalt()
+    expect(open).toMatchObject({ contract_id: CONTRACT, last_ledger: null, last_ledger_hash: null, detail: 'no cursor yet' })
+    await expect(runIndexer()).rejects.toThrow(/last folded ledger unknown/)
+  })
+
+  it('npm run reorg:clear acknowledges the open halt and reports a no-op when there is none', async () => {
+    const lines: string[] = []
+    const log = { log: (m: string) => lines.push(m) }
+
+    expect(await clearRecordedReorg(log)).toEqual({ halt: null, cleared: 0 })
+    expect(lines.at(-1)).toMatch(/nothing to do/)
+
+    await recordReorgHalt(CONTRACT, new ReorgDetectedError('rpc served a stale hash'))
+    const result = await clearRecordedReorg(log)
+    expect(result.cleared).toBe(1)
+    expect(result.halt?.detail).toBe('rpc served a stale hash')
+    expect(lines.join('\n')).toMatch(/last folded ledger 500/)
+    expect(lines.at(-1)).toMatch(/cleared 1 record/)
+    expect(await loadUnclearedReorgHalt()).toBeNull()
+    expect((await halts())[0]?.cleared_by).toBe('operator')
   })
 
   it('recording never masks the halt: a failed insert is logged and the error still propagates', async () => {
