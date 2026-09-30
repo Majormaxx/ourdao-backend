@@ -206,6 +206,52 @@ describe('API: proposals, stats, events, admin/log', () => {
     expect(body.every((e: { contract_id: string }) => e.contract_id === 'CNEW')).toBe(true)
   })
 
+  // Issue #278
+  it('GET /api/events?from_ledger=&to_ledger= filters by ledger range, additively with other filters', async () => {
+    await query(
+      `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data) VALUES
+       ('1-0', 10, now(), 'C1', 'joined', '[]', '[]'),
+       ('2-0', 20, now(), 'C1', 'staked', '[]', '[]'),
+       ('3-0', 30, now(), 'C1', 'joined', '[]', '[]'),
+       ('4-0', 40, now(), 'C1', 'joined', '[]', '[]')`
+    )
+
+    const ranged = await app.inject({ method: 'GET', url: '/api/events?from_ledger=15&to_ledger=35' })
+    expect(ranged.statusCode).toBe(200)
+    const rangedBody = ranged.json().events
+    expect(rangedBody).toHaveLength(2)
+    expect(rangedBody.every((e: { ledger: number }) => e.ledger >= 15 && e.ledger <= 35)).toBe(true)
+
+    // Additive with an existing filter (symbol=joined excludes the ledger-20 `staked` row anyway).
+    const combined = await app.inject({ method: 'GET', url: '/api/events?symbol=joined&from_ledger=15&to_ledger=35' })
+    expect(combined.json().events).toHaveLength(1)
+    expect(combined.json().events[0].ledger).toBe(30)
+
+    // A single bound with no counterpart has no range to validate.
+    const onlyFrom = await app.inject({ method: 'GET', url: '/api/events?from_ledger=35' })
+    expect(onlyFrom.statusCode).toBe(200)
+    expect(onlyFrom.json().events).toHaveLength(1)
+    expect(onlyFrom.json().events[0].ledger).toBe(40)
+  })
+
+  it('GET /api/events rejects invalid from_ledger/to_ledger combinations with 400 (issue #278)', async () => {
+    const backwards = await app.inject({ method: 'GET', url: '/api/events?from_ledger=50&to_ledger=10' })
+    expect(backwards.statusCode).toBe(400)
+
+    const tooWide = await app.inject({ method: 'GET', url: '/api/events?from_ledger=0&to_ledger=10001' })
+    expect(tooWide.statusCode).toBe(400)
+
+    const nonInteger = await app.inject({ method: 'GET', url: '/api/events?from_ledger=abc' })
+    expect(nonInteger.statusCode).toBe(400)
+
+    const negative = await app.inject({ method: 'GET', url: '/api/events?to_ledger=-5' })
+    expect(negative.statusCode).toBe(400)
+
+    // Exactly at the 10000-ledger cap is still valid.
+    const atCap = await app.inject({ method: 'GET', url: '/api/events?from_ledger=0&to_ledger=10000' })
+    expect(atCap.statusCode).toBe(200)
+  })
+
   it('GET /api/admin/log only returns admin/governance symbols, newest first', async () => {
     await query(
       `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data) VALUES

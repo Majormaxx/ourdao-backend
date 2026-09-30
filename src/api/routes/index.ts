@@ -30,6 +30,7 @@ import { getConnectedStreamCount, getNotificationFailureCount, registerStreamEnd
 import { historicalOrLive, setCachePolicy } from '../cache-policy.js'
 import { ConcurrencyGate } from '../load-shedding.js'
 import { withLoanDerived } from '../loan-derived.js'
+import { getOrSetCache, membersListCacheKey, memberSummaryCacheKey } from '../../cache/redis.js'
 import { replayFailedEvent } from '../../indexer/replay.js'
 import { createHistoryCache } from '../history-cache.js'
 
@@ -87,6 +88,40 @@ function invalidEventCursor(v: unknown): boolean {
   return v !== undefined && eventCursor(v) === null
 }
 
+// Issue #278: `?from_ledger=`/`?to_ledger=` on /events. Parses a single bound
+// to a non-negative integer, or null if absent/malformed (mirrors `cursor`
+// above). Ledger 0 is a legitimate lower bound (the genesis ledger), unlike
+// the `cursor`/`limit` helpers above where 0 means "absent" — so this can't
+// reuse those.
+function ledgerBound(v: unknown): number | null {
+  if (v === undefined || v === null || v === '') return null
+  const raw = String(v).trim()
+  if (!/^[0-9]+$/.test(raw)) return null
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n >= 0 ? n : null
+}
+
+// Issue #278: max span a single from_ledger/to_ledger query may cover — wide
+// enough for any realistic dashboard range query, and small enough that a
+// full-range scan can't be used to force an unbounded sequential scan.
+const MAX_LEDGER_RANGE = 10_000
+
+// Validates `from_ledger`/`to_ledger` together: each must be a well-formed
+// non-negative integer when present, `from_ledger <= to_ledger` when both are
+// given, and the span between them must not exceed MAX_LEDGER_RANGE. A
+// single bound (only `from_ledger` or only `to_ledger`) has no span to check.
+function invalidLedgerRange(fromRaw: unknown, toRaw: unknown): boolean {
+  if (fromRaw !== undefined && ledgerBound(fromRaw) === null) return true
+  if (toRaw !== undefined && ledgerBound(toRaw) === null) return true
+  const from = ledgerBound(fromRaw)
+  const to = ledgerBound(toRaw)
+  if (from !== null && to !== null) {
+    if (from > to) return true
+    if (to - from > MAX_LEDGER_RANGE) return true
+  }
+  return false
+}
+
 function validAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address)
 }
@@ -137,6 +172,87 @@ async function entityTimeline(symbols: readonly string[], id: string): Promise<T
   return rows.map(toTimelineEntry)
 }
 
+// Issue #277: pulled out of the route handler so it can be called from
+// inside `getOrSetCache`'s fetcher without the handler itself growing an
+// inline template-literal SQL block wrapped in another closure. Behavior is
+// unchanged from before this issue — same CTEs, same shape, `null` when the
+// address has no member row.
+async function fetchMemberSummary(address: string): Promise<MemberSummary | null> {
+  const row = await queryOne<{ summary: MemberSummary }>(`
+    WITH m AS (
+      SELECT * FROM members WHERE address = $1
+    ),
+    totals AS (
+      -- Issue #164: both denominators must match the contract's own
+      -- definition of a member's claim. calculate_exit_share() in
+      -- ourdao-contracts (contracts/dao/src/membership.rs) computes
+      -- treasury * contribution / total_active_contributions, where
+      -- total_active_contributions sums 'contribution' only over members
+      -- with MemberStatus::ActiveMember — the same exited = false this
+      -- table already (correctly) uses for total_stake, and for
+      -- active_members/total_staked in /api/stats. contribution_share_bps
+      -- is therefore a member's share of *currently active* contribution,
+      -- matching what the contract would actually pay on exit, not a
+      -- share of every contribution ever made including exited members'.
+      SELECT
+        (SELECT COALESCE(SUM(contribution), 0) FROM members WHERE exited = false) as total_contribution,
+        (SELECT COALESCE(SUM(stake), 0) FROM members WHERE exited = false) as total_stake
+    ),
+    unread_notifs AS (
+      SELECT COUNT(*) as unread_count FROM notifications WHERE address = $1 AND read = false
+    ),
+    -- Issue #165: aggregates run over the member's *entire* loan history —
+    -- independent of ${LOANS_EMBED_LIMIT}, the cap on the embedded list
+    -- below — so a long-tenured member's repaid/defaulted counts and
+    -- defaulted value are never silently wrong just because they have
+    -- more than ${LOANS_EMBED_LIMIT} loans.
+    member_loans_agg AS (
+      SELECT COUNT(*) as total_count,
+             COUNT(*) FILTER (WHERE status = 'repaid') as repaid_loans_count,
+             COUNT(*) FILTER (WHERE status = 'defaulted') as defaulted_loans_count,
+             COALESCE(SUM(outstanding) FILTER (WHERE status = 'defaulted'), 0) as defaulted_loans_value
+      FROM loans WHERE borrower = $1
+    ),
+    -- The embedded list itself stays capped at ${LOANS_EMBED_LIMIT} (full
+    -- history is available, paginated, from GET /api/loans?borrower=) but
+    -- now with an explicit column list instead of SELECT *, and the
+    -- truncation is now visible via loans_total_count/loans_truncated
+    -- below rather than silent.
+    member_loans_embed AS (
+      SELECT COALESCE(json_agg(row_to_json(l)), '[]'::json) as loans
+      FROM (
+        SELECT id, borrower, amount, outstanding, total_repayment, status,
+               approved_ledger, due_time, repaid_ledger, defaulted_ledger, updated_at
+        FROM loans WHERE borrower = $1 ORDER BY id DESC LIMIT ${LOANS_EMBED_LIMIT}
+      ) l
+    )
+    SELECT
+      json_build_object(
+        'member', row_to_json(m.*),
+        'loans', (SELECT loans FROM member_loans_embed),
+        'loans_total_count', (SELECT total_count::int FROM member_loans_agg),
+        'loans_truncated', (SELECT total_count > ${LOANS_EMBED_LIMIT} FROM member_loans_agg),
+        'unread_notifications', (SELECT unread_count::int FROM unread_notifs),
+        'position', json_build_object(
+          'contribution_share_bps', CASE
+            WHEN (SELECT total_contribution FROM totals) > 0 AND m.exited = false
+            THEN TRUNC((m.contribution * 10000) / (SELECT total_contribution FROM totals))::text
+            ELSE '0'
+          END,
+          'stake_share_bps', CASE
+            WHEN (SELECT total_stake FROM totals) > 0 AND m.exited = false
+            THEN TRUNC((m.stake * 10000) / (SELECT total_stake FROM totals))::text
+            ELSE '0'
+          END,
+          'repaid_loans_count', COALESCE((SELECT repaid_loans_count::int FROM member_loans_agg), 0),
+          'defaulted_loans_count', COALESCE((SELECT defaulted_loans_count::int FROM member_loans_agg), 0),
+          'defaulted_loans_value', COALESCE((SELECT defaulted_loans_value FROM member_loans_agg), 0)::text
+        )
+      ) as summary
+    FROM m
+  `, [address])
+
+  return row?.summary ?? null
 // Issue #291: write one row to admin_audit_log for every authenticated admin
 // action. Called fire-and-forget — a logging failure must never block the
 // action itself; errors are logged via the request logger so they appear in
@@ -219,11 +335,18 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     const q = req.query as Record<string, unknown>
     if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
-    return query<MemberRow>(
-      `SELECT * FROM members
-        WHERE exited = false AND joined_ledger IS NOT NULL
-        ORDER BY joined_ledger DESC NULLS LAST LIMIT $1`,
-      [l]
+    // Issue #277: this ordered member listing is the closest thing this
+    // codebase has to a "leaderboard" and, like /members/:address/summary
+    // below, is heavy enough (full table scan + sort) to be worth a
+    // short-lived read-through cache. Falls straight through to Postgres
+    // when REDIS_URL isn't configured — see src/cache/redis.ts.
+    return getOrSetCache(membersListCacheKey(l), config.cache.memberCacheTtlSeconds, () =>
+      query<MemberRow>(
+        `SELECT * FROM members
+          WHERE exited = false AND joined_ledger IS NOT NULL
+          ORDER BY joined_ledger DESC NULLS LAST LIMIT $1`,
+        [l]
+      )
     )
   })
 
@@ -243,87 +366,25 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
 
-    const summary = await queryOne<{ summary: MemberSummary }>(`
-      WITH m AS (
-        SELECT * FROM members WHERE address = $1
-      ),
-      totals AS (
-        -- Issue #164: both denominators must match the contract's own
-        -- definition of a member's claim. calculate_exit_share() in
-        -- ourdao-contracts (contracts/dao/src/membership.rs) computes
-        -- treasury * contribution / total_active_contributions, where
-        -- total_active_contributions sums 'contribution' only over members
-        -- with MemberStatus::ActiveMember — the same exited = false this
-        -- table already (correctly) uses for total_stake, and for
-        -- active_members/total_staked in /api/stats. contribution_share_bps
-        -- is therefore a member's share of *currently active* contribution,
-        -- matching what the contract would actually pay on exit, not a
-        -- share of every contribution ever made including exited members'.
-        SELECT
-          (SELECT COALESCE(SUM(contribution), 0) FROM members WHERE exited = false) as total_contribution,
-          (SELECT COALESCE(SUM(stake), 0) FROM members WHERE exited = false) as total_stake
-      ),
-      unread_notifs AS (
-        SELECT COUNT(*) as unread_count FROM notifications WHERE address = $1 AND read = false
-      ),
-      -- Issue #165: aggregates run over the member's *entire* loan history —
-      -- independent of ${LOANS_EMBED_LIMIT}, the cap on the embedded list
-      -- below — so a long-tenured member's repaid/defaulted counts and
-      -- defaulted value are never silently wrong just because they have
-      -- more than ${LOANS_EMBED_LIMIT} loans.
-      member_loans_agg AS (
-        SELECT COUNT(*) as total_count,
-               COUNT(*) FILTER (WHERE status = 'repaid') as repaid_loans_count,
-               COUNT(*) FILTER (WHERE status = 'defaulted') as defaulted_loans_count,
-               COALESCE(SUM(outstanding) FILTER (WHERE status = 'defaulted'), 0) as defaulted_loans_value
-        FROM loans WHERE borrower = $1
-      ),
-      -- The embedded list itself stays capped at ${LOANS_EMBED_LIMIT} (full
-      -- history is available, paginated, from GET /api/loans?borrower=) but
-      -- now with an explicit column list instead of SELECT *, and the
-      -- truncation is now visible via loans_total_count/loans_truncated
-      -- below rather than silent.
-      member_loans_embed AS (
-        SELECT COALESCE(json_agg(row_to_json(l)), '[]'::json) as loans
-        FROM (
-          SELECT id, borrower, amount, outstanding, total_repayment, status,
-                 approved_ledger, due_time, repaid_ledger, defaulted_ledger, updated_at
-          FROM loans WHERE borrower = $1 ORDER BY id DESC LIMIT ${LOANS_EMBED_LIMIT}
-        ) l
-      )
-      SELECT
-        json_build_object(
-          'member', row_to_json(m.*),
-          'loans', (SELECT loans FROM member_loans_embed),
-          'loans_total_count', (SELECT total_count::int FROM member_loans_agg),
-          'loans_truncated', (SELECT total_count > ${LOANS_EMBED_LIMIT} FROM member_loans_agg),
-          'unread_notifications', (SELECT unread_count::int FROM unread_notifs),
-          'position', json_build_object(
-            'contribution_share_bps', CASE
-              WHEN (SELECT total_contribution FROM totals) > 0 AND m.exited = false
-              THEN TRUNC((m.contribution * 10000) / (SELECT total_contribution FROM totals))::text
-              ELSE '0'
-            END,
-            'stake_share_bps', CASE
-              WHEN (SELECT total_stake FROM totals) > 0 AND m.exited = false
-              THEN TRUNC((m.stake * 10000) / (SELECT total_stake FROM totals))::text
-              ELSE '0'
-            END,
-            'repaid_loans_count', COALESCE((SELECT repaid_loans_count::int FROM member_loans_agg), 0),
-            'defaulted_loans_count', COALESCE((SELECT defaulted_loans_count::int FROM member_loans_agg), 0),
-            'defaulted_loans_value', COALESCE((SELECT defaulted_loans_value FROM member_loans_agg), 0)::text
-          )
-        ) as summary
-      FROM m
-    `, [req.params.address])
+    // Issue #277: this is one of the heaviest reads in the API (several CTEs,
+    // an aggregate over the member's full loan history) and is keyed
+    // per-address, so it's cached the same way as /api/members above. A
+    // "member not found" result is cached too (as `null`) rather than
+    // special-cased out of the cache — the `joined` handler's cache
+    // invalidation (see src/indexer/poller.ts) clears exactly this key the
+    // moment that address actually becomes a member, so a fresh join is
+    // never stuck behind a stale negative lookup for the full TTL.
+    const address = req.params.address
+    const result = await getOrSetCache(memberSummaryCacheKey(address), config.cache.memberCacheTtlSeconds, async () => {
+      const summary = await fetchMemberSummary(address)
+      if (!summary) return null
+      if (summary.loans && Array.isArray(summary.loans)) {
+        summary.loans = summary.loans.map((l) => withLoanDerived(l, req.log))
+      }
+      return summary
+    })
 
-    if (!summary || !summary.summary) return reply.code(404).send({ error: 'member not found' })
-
-    const result = summary.summary
-    if (result.loans && Array.isArray(result.loans)) {
-      result.loans = result.loans.map((l) => withLoanDerived(l, req.log))
-    }
-
+    if (!result) return reply.code(404).send({ error: 'member not found' })
     return result
   })
 
@@ -491,7 +552,17 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     if (invalidEventCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
     if (invalidEventCursor(q.after)) return reply.code(400).send({ error: 'invalid after cursor' })
     if (before !== null && after !== null) return reply.code(400).send({ error: 'cannot use before and after together' })
-    
+
+    // Issue #278: ledger-range filter, additive with symbol/contract/
+    // decode_error/before/after below.
+    if (invalidLedgerRange(q.from_ledger, q.to_ledger)) {
+      return reply.code(400).send({
+        error: 'invalid ledger range: from_ledger/to_ledger must be non-negative integers, from_ledger <= to_ledger, and the range must not exceed 10000 ledgers',
+      })
+    }
+    const fromLedger = ledgerBound(q.from_ledger)
+    const toLedger = ledgerBound(q.to_ledger)
+
     const order = typeof q.order === 'string' && q.order === 'asc' ? 'ASC' : 'DESC'
 
     setCachePolicy(reply, historicalOrLive(before !== null || after !== null))
@@ -512,6 +583,18 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     }
     if (decodeError) {
       conditions.push(`decode_error IS NOT NULL`)
+    }
+    // Issue #278: plain `ledger >= $N` / `ledger <= $N` — no function or cast
+    // wraps the column, so Postgres can still use events_ledger_id_idx
+    // (a btree on (ledger, id), see src/db/migrations/0015_events_ledger_id_idx.sql)
+    // for these range conditions.
+    if (fromLedger !== null) {
+      params.push(fromLedger)
+      conditions.push(`ledger >= $${params.length}`)
+    }
+    if (toLedger !== null) {
+      params.push(toLedger)
+      conditions.push(`ledger <= $${params.length}`)
     }
     if (before !== null) {
       if (before.id) {
@@ -605,7 +688,51 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
 
   // --- Admin/governance audit log (init, admin add/remove, threshold,
   // policy, pause/unpause) ---
-  app.get('/admin/log', async (req, reply) => {
+  app.get('/admin/log', {
+    // Issue #280: first `schema:` block in this file — see the block comment
+    // above /admin/failed-events below for why these two routes only
+    // document the response codes their handlers can actually produce (no
+    // 401: neither route is auth-gated; no 404: both always return an array,
+    // empty or not).
+    schema: {
+      tags: ['admin'],
+      summary: 'Admin/governance audit log',
+      description:
+        'Raw events for admin/governance-lifecycle symbols only (init, admin add/remove, threshold, policy, pause/unpause) — a public audit trail read straight off the chain. Optionally scoped to one contract deployment.',
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'string', description: 'Max rows to return (1-200, default 50).' },
+          before: { type: 'string', description: 'Pagination cursor: return rows with a strictly smaller ledger than this value.' },
+          contract: { type: 'string', description: 'Restrict to one contract deployment id.' },
+        },
+      },
+      response: {
+        200: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              ledger: { type: 'integer' },
+              closed_at: { type: 'string', format: 'date-time' },
+              contract_id: { type: 'string' },
+              symbol: { type: 'string' },
+              topics: {},
+              data: {},
+              tx_hash: { type: 'string', nullable: true },
+              decode_error: { type: 'string', nullable: true },
+              created_at: { type: 'string', format: 'date-time' },
+            },
+          },
+        },
+        400: {
+          type: 'object',
+          properties: { error: { type: 'string' } },
+        },
+      },
+    },
+  }, async (req, reply) => {
     const q = req.query as Record<string, unknown>
     if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
@@ -738,7 +865,47 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // `classifyError`'s own rule — raw exception text is never put in a
   // response, only logged (and still queryable directly against Postgres by
   // an operator) — rather than gating the whole endpoint behind auth.
-  app.get('/admin/failed-events', async (req, reply) => {
+  app.get('/admin/failed-events', {
+    // Issue #280: documents the quarantine view referenced above — "admin"
+    // here means operator diagnostics, not an auth-gated route (see the
+    // block comment above this handler), so no 401 is documented; the
+    // handler always returns an array (possibly empty), so no 404 either —
+    // only the response codes it can actually produce.
+    schema: {
+      tags: ['admin'],
+      summary: 'Quarantined (deterministically-failed) events',
+      description:
+        'Events whose fold handler threw deterministically and were isolated rather than retried forever (issue #43) — the operator-facing view of the quarantine. Never includes the raw exception text; that is logged, not returned, so this endpoint stays safe to leave unauthenticated.',
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'string', description: 'Max rows to return (1-200, default 50).' },
+          before: { type: 'string', description: 'Pagination cursor: return rows with a strictly smaller id than this value.' },
+          unresolved: { type: 'string', enum: ['true', 'false'], description: 'When "true", only rows a reindex/replay has not yet resolved.' },
+        },
+      },
+      response: {
+        200: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'integer' },
+              event_id: { type: 'string' },
+              symbol: { type: 'string' },
+              ledger: { type: 'integer' },
+              created_at: { type: 'string', format: 'date-time' },
+              resolved_at: { type: 'string', format: 'date-time', nullable: true },
+            },
+          },
+        },
+        400: {
+          type: 'object',
+          properties: { error: { type: 'string' } },
+        },
+      },
+    },
+  }, async (req, reply) => {
     const q = req.query as Record<string, unknown>
     if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)

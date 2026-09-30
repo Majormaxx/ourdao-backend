@@ -8,6 +8,8 @@ import { decodeEvent, type DecodedEvent } from '../stellar/events.js'
 import { applyEvent } from './handlers.js'
 import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
 import { REINDEX_LOCK_KEY } from './reindex.js'
+import { notifyStreamClientsAfterCommit, STREAM_CHANNELS, type StreamChannel } from '../api/stream.js'
+import { invalidateCache, invalidateMembersListCache, memberSummaryCacheKey } from '../cache/redis.js'
 import { notifyStreamClientsAfterCommit, type StreamChannel } from '../api/stream.js'
 import { getTracer } from '../telemetry.js'
 
@@ -198,6 +200,30 @@ async function resolveStartLedger(): Promise<number> {
  *
  *  Shared by the whole-page path and the per-event quarantine path (issue
  *  #43) so both write the same row the same way. */
+/** Issue #277: invalidate the read-through caches that `applyEvent`'s fold
+ *  just made stale, once (and only once) its transaction has actually
+ *  committed — same "after commit, on a separate connection" discipline as
+ *  `notifyStreamClientsAfterCommit` right below each call site, and for the
+ *  same reason: a cache write must never ride on, or be able to poison, the
+ *  fold transaction's own connection. Only `STREAM_CHANNELS.members` events
+ *  (joined/exited/staked/unstaked/claimed — see channelMap in handlers.ts)
+ *  actually touch cached member state, so every other channel is a no-op
+ *  here. Every one of those handlers keys off an address field named
+ *  `member` (see requireAddr(ev, 'member') in handlers.ts) — if that field
+ *  is somehow missing the members-list cache is still invalidated, just not
+ *  the (unknown) per-address summary key. A cache failure here is swallowed
+ *  by invalidateCache/invalidateMembersListCache themselves — it can only
+ *  ever cost an extra `MEMBER_CACHE_TTL_SECONDS` of staleness, never crash
+ *  the indexer. */
+async function invalidateMemberCachesAfterCommit(channel: StreamChannel | undefined, ev: DecodedEvent): Promise<void> {
+  if (channel !== STREAM_CHANNELS.members) return
+  await invalidateMembersListCache()
+  const address = ev.fields?.member
+  if (typeof address === 'string' && address) {
+    await invalidateCache(memberSummaryCacheKey(address))
+  }
+}
+
 async function insertRawEvent(client: PoolClient, ev: DecodedEvent): Promise<boolean> {
   const res = await client.query<{ folded_at: string | null }>(
     `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash, decode_error)
@@ -297,6 +323,7 @@ async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): 
   // logged and counted by notifyStreamClientsAfterCommit itself; it cannot
   // roll back or otherwise affect the fold, which is already durable.
   for (const { channel, ev } of pendingNotifications) {
+    await invalidateMemberCachesAfterCommit(channel, ev)
     await notifyStreamClientsAfterCommit(channel, {
       symbol: ev.symbol,
       ledger: ev.ledger,
@@ -429,6 +456,7 @@ async function ingestEventQuarantined(ev: DecodedEvent, lastLedger: number): Pro
   }
 
   if (committedChannel) {
+    await invalidateMemberCachesAfterCommit(committedChannel, ev)
     await notifyStreamClientsAfterCommit(committedChannel, {
       symbol: ev.symbol,
       ledger: ev.ledger,
