@@ -1,4 +1,5 @@
 import './worker-role.js'
+import { initTelemetry, shutdownTelemetry } from './telemetry.js'
 import { migrate } from './db/migrate.js'
 import { pool, createDedicatedClient } from './db/index.js'
 import { runIndexer, stopIndexer } from './indexer/poller.js'
@@ -60,6 +61,10 @@ function runMaintenanceLoop(signal: AbortSignal): { stopped: Promise<void> } {
 }
 
 async function main(): Promise<void> {
+  // Issue #288: registered before anything else runs, matching OpenTelemetry's
+  // own recommended Node.js bootstrap ordering — a no-op when OTEL_ENABLED
+  // is unset (the default), see src/telemetry.ts.
+  initTelemetry()
   await migrate()
 
   const maintenanceAbort = new AbortController()
@@ -107,6 +112,7 @@ async function main(): Promise<void> {
 
     console.log('[indexer] closing database pool')
     await pool.end()
+    await shutdownTelemetry()
     console.log('[indexer] shutdown complete')
     process.exit(0)
   }

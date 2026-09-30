@@ -23,6 +23,12 @@ import { logger } from '../logger.js'
  */
 
 export class ReplayLockError extends Error {
+  // Issue #283: src/api/errors.ts's classifyError treats a thrown error with
+  // an explicit 4xx statusCode as "chosen on purpose" and keeps its message
+  // verbatim in the response — so the HTTP re-evaluate endpoint needs no
+  // separate try/catch to map this to 409, it just propagates.
+  readonly statusCode = 409
+
   constructor(eventId: string) {
     super(
       `Cannot replay event ${eventId}: reindex or the live indexer worker is currently folding events ` +

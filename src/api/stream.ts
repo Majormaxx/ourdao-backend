@@ -76,6 +76,19 @@ export const MAX_QUEUED_MESSAGES = 200
 // forever without ever growing its queue enough to trip that bound.
 export const DRAIN_STALL_DISCONNECT_MS = 30_000
 
+// Issue #285: when a heartbeat tick lands while the client is backpressured
+// (paused), it's retried with exponential backoff instead of silently
+// skipped until the next fixed 30s tick — a brief mobile-network hiccup
+// otherwise goes an extra ~30s with no heartbeat, right when the socket is
+// least healthy. Deliberately NOT queued via the normal frame `queue`
+// (enqueue()'s own doc comment on why heartbeats skip that path still
+// applies: repeatedly queuing heartbeat frames onto an already-stalled
+// socket only brings the queue-overflow disconnect sooner for no benefit) —
+// this instead polls "is the socket writable yet?" at a backing-off
+// interval and sends live, the moment it succeeds.
+export const HEARTBEAT_RETRY_INITIAL_MS = 1_000
+export const HEARTBEAT_RETRY_MAX_MS = 16_000
+
 // Issue #157 / #156: transport-level backstop. A healthy connection always
 // has outbound traffic at least every 30s (the heartbeat), so this never
 // fires for one; a genuinely stalled socket (suspended mobile browser, slept
@@ -221,10 +234,15 @@ class SharedListener {
       await client.connect()
 
       try {
-        const cursor = await client.query<{ last_ledger: number | null }>(
-          'SELECT last_ledger FROM indexer_cursor WHERE id = 1'
+        // Issue #289: indexer_cursor now has one row per tailed contract.
+        // MAX(last_ledger) matches this frontier's own semantics (the
+        // highest ledger carried by any change notification seen so far,
+        // regardless of which contract it came from) and is exactly the
+        // single-contract behavior when there's only one row.
+        const cursor = await client.query<{ max: number | null }>(
+          'SELECT MAX(last_ledger) FROM indexer_cursor'
         )
-        const seeded = cursor.rows[0]?.last_ledger
+        const seeded = cursor.rows[0]?.max
         // Guard against moving the frontier backwards (matches
         // dispatchStreamNotification's own guard) — a reconnect can race a
         // NOTIFY that already advanced `knownLedger.value` past this SELECT.
@@ -312,6 +330,10 @@ export class StreamClient {
   private paused = false
   private queue: string[] = []
   private stallTimer: NodeJS.Timeout | null = null
+  // Issue #285: exponential-backoff retry for a heartbeat tick that landed
+  // while paused. Non-null only while a retry is pending.
+  private heartbeatRetryTimer: NodeJS.Timeout | null = null
+  private heartbeatRetryDelayMs = HEARTBEAT_RETRY_INITIAL_MS
   // Issue #155: the highest ledger sequence this client has been shown,
   // seeded from the process-wide `knownLedger` at connect time. Used as the
   // SSE `id:` for every frame — monotonic and meaningful (a real ledger
@@ -398,10 +420,14 @@ export class StreamClient {
     // Start heartbeat to keep connection alive (every 30 seconds)
     this.heartbeatTimer = setInterval(() => {
       if (this.closed) return
-      // Issue #157: skip heartbeats for a client that's already backed up —
-      // adding more unflushable writes to a stalled socket only makes the
-      // eventual queue overflow arrive sooner for no benefit.
-      if (this.paused) return
+      if (this.paused) {
+        // Issue #285: don't add another frame to an already-stalled socket's
+        // queue (see enqueue()'s doc comment); instead retry with backoff
+        // until the socket drains, rather than silently skipping until the
+        // next fixed 30s tick.
+        this.scheduleHeartbeatRetry()
+        return
+      }
       this.sendMessage({
         type: 'heartbeat',
         timestamp: Date.now(),
@@ -430,8 +456,14 @@ export class StreamClient {
 
   /**
    * Send a message to the client via SSE, respecting backpressure (issue #157).
+   *
+   * `force` (issue #285) bypasses the pause check and attempts a real write
+   * regardless of the last-known `paused` state — used only by the heartbeat
+   * retry loop, to actually test current writability rather than queuing
+   * behind (or trusting a `paused` flag that only updates on the next real
+   * `drain` event).
    */
-  private sendMessage(msg: StreamMessage): void {
+  private sendMessage(msg: StreamMessage, opts: { force?: boolean } = {}): void {
     if (this.closed) return
 
     // Issue #155: advance this client's id baseline whenever a message
@@ -455,7 +487,7 @@ export class StreamClient {
     // one write() return value governs this whole frame's backpressure.
     const frame = `event: ${eventType}\nid: ${id}\ndata: ${data}\n\n`
 
-    if (this.paused) {
+    if (this.paused && !opts.force) {
       this.enqueue(frame)
       return
     }
@@ -465,7 +497,15 @@ export class StreamClient {
   private writeFrame(frame: string): void {
     try {
       const ok = this.reply.raw.write(frame)
-      if (!ok) {
+      if (ok) {
+        // Issue #285: explicit reset (previously a no-op in every prior call
+        // site, since writeFrame was only ever reached while already
+        // unpaused) — needed now that the heartbeat retry loop can call this
+        // while `paused` is still true, to correctly observe recovery from a
+        // real write succeeding rather than only from a 'drain' event.
+        this.paused = false
+        this.clearStallTimer()
+      } else {
         this.paused = true
         this.armStallTimer()
       }
@@ -516,6 +556,47 @@ export class StreamClient {
   }
 
   /**
+   * Begins (or is a no-op if already running) an exponential-backoff retry
+   * loop for a heartbeat that landed while `paused` (issue #285). Actual
+   * disconnection for a client that never recovers is still governed
+   * entirely by the existing stall timer (`armStallTimer`,
+   * `DRAIN_STALL_DISCONNECT_MS`), armed by whatever write first set
+   * `paused` — this loop only ever retries or gives up quietly, never
+   * disconnects on its own.
+   */
+  private scheduleHeartbeatRetry(): void {
+    if (this.heartbeatRetryTimer) return
+    this.heartbeatRetryDelayMs = HEARTBEAT_RETRY_INITIAL_MS
+    this.armHeartbeatRetry()
+  }
+
+  private armHeartbeatRetry(): void {
+    this.heartbeatRetryTimer = setTimeout(() => {
+      this.heartbeatRetryTimer = null
+      if (this.closed) return
+      // `force: true` attempts a real write regardless of the last-known
+      // `paused` value — that flag only updates on the next real 'drain'
+      // event, which this retry can't wait on without reintroducing the
+      // "silently stuck until something else happens" problem this exists
+      // to fix. writeFrame's return-value handling (above) is what actually
+      // learns whether the socket is writable now.
+      this.sendMessage({ type: 'heartbeat', timestamp: Date.now() }, { force: true })
+      if (this.paused) {
+        this.heartbeatRetryDelayMs = Math.min(this.heartbeatRetryDelayMs * 2, HEARTBEAT_RETRY_MAX_MS)
+        this.armHeartbeatRetry()
+      }
+    }, this.heartbeatRetryDelayMs)
+    if (this.heartbeatRetryTimer.unref) this.heartbeatRetryTimer.unref()
+  }
+
+  private clearHeartbeatRetry(): void {
+    if (this.heartbeatRetryTimer) {
+      clearTimeout(this.heartbeatRetryTimer)
+      this.heartbeatRetryTimer = null
+    }
+  }
+
+  /**
    * Clean up resources and close the connection.
    * Idempotent and safe under concurrent invocation (issue #159).
    */
@@ -524,6 +605,7 @@ export class StreamClient {
     this.closed = true
     this.queue = []
     this.clearStallTimer()
+    this.clearHeartbeatRetry()
 
     this.releasePromise = this.doClose()
     return this.releasePromise

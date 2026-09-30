@@ -50,15 +50,15 @@ describe('API: proposals, stats, events, admin/log', () => {
     )
     await query(`INSERT INTO treasury_proposals (id, amount, destination) VALUES (1, 500, 'GD')`)
     await query(
-      `INSERT INTO indexer_cursor (id, last_ledger) VALUES (1, 999)
-       ON CONFLICT (id) DO UPDATE SET last_ledger = 999`
+      `INSERT INTO indexer_cursor (contract_id, last_ledger) VALUES ('CTEST', 999)
+       ON CONFLICT (contract_id) DO UPDATE SET last_ledger = 999`
     )
 
     await query(
       `UPDATE dao_totals SET interest_collected = 4200, principal_lent = 9000,
               principal_repaid = 3000, value_defaulted = 88 WHERE id = 1`
     )
-    await query(`UPDATE indexer_cursor SET observed_tip_ledger = 1200 WHERE id = 1`)
+    await query(`UPDATE indexer_cursor SET observed_tip_ledger = 1200 WHERE contract_id = 'CTEST'`)
     await query(
       `INSERT INTO failed_events (event_id, symbol, ledger, error) VALUES ('999-0', 'loan_dflt', 999, 'boom')`
     )
@@ -97,7 +97,7 @@ describe('API: proposals, stats, events, admin/log', () => {
   })
 
   it('GET /api/stats is cached: a burst of calls issues one set of queries (issue #18)', async () => {
-    await query(`INSERT INTO indexer_cursor (id, last_ledger) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET last_ledger = 5`)
+    await query(`INSERT INTO indexer_cursor (contract_id, last_ledger) VALUES ('CTEST', 5) ON CONFLICT (contract_id) DO UPDATE SET last_ledger = 5`)
     const spy = vi.spyOn(pool, 'query')
     try {
       const first = await app.inject({ method: 'GET', url: '/api/stats' })

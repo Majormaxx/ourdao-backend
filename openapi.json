@@ -268,6 +268,66 @@
         }
       }
     },
+    "/api/stats/history": {
+      "get": {
+        "summary": "Historical daily loan aggregates",
+        "tags": [
+          "Stats"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "date",
+                          "principalLent",
+                          "principalRepaid",
+                          "defaults",
+                          "valueDefaulted",
+                          "cumulativeDefaultRatePercent"
+                        ],
+                        "properties": {
+                          "date": {
+                            "type": "string",
+                            "format": "date"
+                          },
+                          "principalLent": {
+                            "type": "string"
+                          },
+                          "principalRepaid": {
+                            "type": "string"
+                          },
+                          "defaults": {
+                            "type": "integer"
+                          },
+                          "valueDefaulted": {
+                            "type": "string"
+                          },
+                          "cumulativeDefaultRatePercent": {
+                            "type": "number"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "responses": {

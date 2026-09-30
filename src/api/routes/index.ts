@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import { StrKey } from '@stellar/stellar-sdk'
-import { query, queryOne } from '../../db/index.js'
+import { query, queryOne, withTransaction } from '../../db/index.js'
 import { config } from '../../config.js'
 import {
   ADMIN_EVENT_SYMBOLS,
@@ -22,6 +22,8 @@ import type {
   DocumentRow,
   FailedEventRow,
   TimelineEntry,
+  AdminAuditLogRow,
+  AdminAuditAction,
 } from '../../types.js'
 import { authenticateRequest, classifyStellarAddress, NonceStoreCapacityError, type NonceStore } from '../../auth.js'
 import { getConnectedStreamCount, getNotificationFailureCount, registerStreamEndpoint } from '../stream.js'
@@ -29,6 +31,8 @@ import { historicalOrLive, setCachePolicy } from '../cache-policy.js'
 import { ConcurrencyGate } from '../load-shedding.js'
 import { withLoanDerived } from '../loan-derived.js'
 import { getOrSetCache, membersListCacheKey, memberSummaryCacheKey } from '../../cache/redis.js'
+import { replayFailedEvent } from '../../indexer/replay.js'
+import { createHistoryCache } from '../history-cache.js'
 
 function parseLimit(v: unknown, def = 50, max = 200): number | null {
   if (v === undefined || v === null || v === '') return def
@@ -249,10 +253,38 @@ async function fetchMemberSummary(address: string): Promise<MemberSummary | null
   `, [address])
 
   return row?.summary ?? null
+// Issue #291: write one row to admin_audit_log for every authenticated admin
+// action. Called fire-and-forget — a logging failure must never block the
+// action itself; errors are logged via the request logger so they appear in
+// the operator's log stream with the same correlation id as the action.
+//
+// `ip` is the request IP (req.ip in Fastify, which respects TRUST_PROXY); it
+// is stored as-is — trust level depends on how the server is deployed.
+// `payload` is an action-specific object (event id, ledger, etc.) that gives
+// an auditor enough context to reconstruct what changed.
+async function writeAuditLog(
+  adminAddress: string,
+  action: AdminAuditAction | string,
+  ip: string | null,
+  payload: Record<string, unknown>,
+  log: { error(obj: unknown, msg: string): void }
+): Promise<void> {
+  try {
+    await query(
+      `INSERT INTO admin_audit_log (admin_address, action, ip_address, payload)
+       VALUES ($1, $2, $3, $4)`,
+      [adminAddress, action, ip ?? null, JSON.stringify(payload)]
+    )
+  } catch (err) {
+    // Never let a logging failure surface to the caller — log it and move on.
+    log.error({ err }, `[audit] failed to write audit log entry action=${action}`)
+  }
 }
 
 export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: NonceStore }): Promise<void> {
   const { nonceStore } = opts
+  const historyCache = createHistoryCache()
+  app.addHook('onClose', async () => historyCache.close())
 
   // --- SSE stream (issues #63, #158) ---
   // Registered inside the `/api` plugin so it inherits the prefix and any
@@ -905,6 +937,137 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     return rows
   })
 
+  // --- Re-evaluate a quarantined event (issue #283) ---
+  // The middle ground between "leave it quarantined" and `npm run reindex`
+  // (which rebuilds every derived table from the entire raw log): re-attempt
+  // the fold for exactly this one event, once a contract or decoder fix has
+  // shipped, without a maintainer hand-editing `failed_events`/`events` over
+  // psql. All the actual logic (advisory-lock coordination with the live
+  // poller/reindex, idempotency, updating the existing failed_events row
+  // rather than inserting a new one) already lives in
+  // `indexer/replay.ts`'s `replayFailedEvent` — added for `npm run
+  // replay-failed` (issue #170) — this route is the HTTP door onto it.
+  //
+  // Same "operator diagnostics, no auth scheme" posture as
+  // GET /admin/failed-events above: reachable without authentication, but a
+  // still-failing replay's raw exception text is never echoed back (only
+  // logged, by replayFailedEvent itself) — mirroring classifyError's rule.
+  app.post<{ Params: { id: string } }>('/admin/failed-events/:id/re-evaluate', async (req, reply) => {
+    const eventId = req.params.id.trim()
+    if (!eventId) return reply.code(400).send({ error: 'invalid event id' })
+
+    // Propagates uncaught on a lock conflict (ReplayLockError carries its
+    // own statusCode; classifyError formats it) or any other unexpected
+    // throw (falls through to a generic 500, message withheld).
+    const outcome = await replayFailedEvent(eventId)
+    if (outcome.status === 'still_failing') {
+      return reply.code(422).send({ eventId: outcome.eventId, status: outcome.status })
+    }
+    return { eventId: outcome.eventId, status: outcome.status }
+  // Issue #287: resolving quarantined events one at a time via direct SQL
+  // doesn't scale once a bad handler/schema change quarantines a batch of
+  // them at once. Accepts up to 500 ids per call (matching this codebase's
+  // other batch-size ceilings) and only touches rows that are still
+  // unresolved — an id that's already resolved, or doesn't exist, is
+  // silently excluded from the count rather than erroring the whole batch,
+  // since a stale/duplicate id in an admin's list shouldn't block resolving
+  // the rest.
+  const MAX_BATCH_RESOLVE_IDS = 500
+  app.post('/admin/failed-events/batch-resolve', async (req, reply) => {
+    const body = req.body as { ids?: unknown; resolution?: unknown; note?: unknown }
+    const ids = body.ids
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return reply.code(400).send({ error: 'ids must be a non-empty array' })
+    }
+    if (ids.length > MAX_BATCH_RESOLVE_IDS) {
+      return reply.code(400).send({ error: `ids must not exceed ${MAX_BATCH_RESOLVE_IDS} entries` })
+    }
+    if (!ids.every((id) => Number.isSafeInteger(id) && id > 0)) {
+      return reply.code(400).send({ error: 'ids must all be positive integers' })
+    }
+    const resolution = body.resolution
+    if (resolution !== 'resolved' && resolution !== 'ignored') {
+      return reply.code(400).send({ error: "resolution must be 'resolved' or 'ignored'" })
+    }
+    const note = body.note
+    if (note !== undefined && typeof note !== 'string') {
+      return reply.code(400).send({ error: 'note must be a string' })
+    }
+
+    const resolvedCount = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE failed_events
+            SET resolved_at = now(), resolution = $1, resolution_note = $2
+          WHERE id = ANY($3::bigint[]) AND resolved_at IS NULL`,
+        [resolution, note ?? null, ids]
+      )
+      return result.rowCount ?? 0
+    })
+
+    return { resolved: resolvedCount }
+  // --- Admin audit log (issue #291) ---
+  // Exposes the immutable admin_audit_log table to authorized maintainers.
+  // Authentication is required: only a holder of a valid Stellar signature
+  // can read the trail — it contains admin addresses and IP addresses that
+  // should not be publicly readable.
+  //
+  // Pagination follows the same `?before=<id>` cursor pattern as every other
+  // list endpoint in this file. `?admin=<G…>` filters to a single operator's
+  // actions; `?action=<label>` filters to a single action type.
+  app.get('/admin/audit-log', async (req, reply) => {
+    // Require authentication — this endpoint surfaces IP addresses and admin
+    // identities that are not appropriate for unauthenticated callers.
+    const auth = await authenticateRequest(req.headers, nonceStore, undefined, req.log)
+    if (!auth.authenticated) {
+      return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
+    }
+
+    const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
+    const l = limit(q.limit)
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+
+    // Optional filter by admin address.
+    if (q.admin !== undefined && q.admin !== '') {
+      if (typeof q.admin !== 'string' || !validAddress(q.admin)) {
+        return reply.code(400).send({ error: 'invalid Stellar address' })
+      }
+    }
+    // Optional filter by action type — any non-empty string is accepted so
+    // future action labels don't require a server deploy to query.
+    if (q.action !== undefined && (typeof q.action !== 'string' || q.action.trim() === '')) {
+      return reply.code(400).send({ error: 'invalid action filter' })
+    }
+
+    const params: unknown[] = []
+    const conditions: string[] = []
+
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`id < $${params.length}`)
+    }
+    if (typeof q.admin === 'string' && q.admin) {
+      params.push(q.admin)
+      conditions.push(`admin_address = $${params.length}`)
+    }
+    if (typeof q.action === 'string' && q.action.trim()) {
+      params.push(q.action.trim())
+      conditions.push(`action = $${params.length}`)
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    params.push(l)
+
+    const rows = await query<AdminAuditLogRow>(
+      `SELECT id, admin_address, action, ip_address, payload, created_at
+         FROM admin_audit_log ${where}
+        ORDER BY id DESC LIMIT $${params.length}`,
+      params
+    )
+    return rows
+  })
+
   // --- Aggregate stats (with indexer freshness — issue #2) ---
   //
   // Issue #18: /api/stats is the hottest endpoint (the frontend polls it
@@ -959,9 +1122,16 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
          (SELECT principal_repaid   FROM dao_totals WHERE id = 1)                  AS principal_repaid,
          (SELECT value_defaulted    FROM dao_totals WHERE id = 1)                  AS value_defaulted,
          (SELECT count(*) FROM failed_events WHERE resolved_at IS NULL)            AS quarantined_events,
-         (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
-         (SELECT observed_tip_ledger FROM indexer_cursor WHERE id = 1)             AS observed_tip_ledger,
-         (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at,
+         -- Issue #289: indexer_cursor has one row per tailed contract now.
+         -- Same "worst row wins" aggregation as /ready — last_ledger,
+         -- observed_tip_ledger and cursor_updated_at must come from the
+         -- *same* row (the least-recently-updated one) so the freshness
+         -- figures derived from them below stay internally consistent,
+         -- rather than each column independently picking a different
+         -- contract's value.
+         (SELECT last_ledger FROM indexer_cursor ORDER BY updated_at ASC NULLS FIRST LIMIT 1) AS last_ledger,
+         (SELECT observed_tip_ledger FROM indexer_cursor ORDER BY updated_at ASC NULLS FIRST LIMIT 1) AS observed_tip_ledger,
+         (SELECT updated_at FROM indexer_cursor ORDER BY updated_at ASC NULLS FIRST LIMIT 1) AS cursor_updated_at,
          (SELECT escalated_at FROM quarantine_state WHERE id = 1)                  AS quarantine_escalated_at`
     )
     const cursorUpdatedAt = row?.cursor_updated_at
@@ -1047,5 +1217,90 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     } finally {
       statsGate.release()
     }
+  })
+
+  app.get('/stats/history', {
+    schema: {
+      tags: ['Stats'],
+      summary: 'Historical daily loan aggregates',
+      response: {
+        200: {
+          type: 'object',
+          required: ['data'],
+          properties: {
+            data: {
+              type: 'array',
+              items: {
+                type: 'object',
+                required: ['date', 'principalLent', 'principalRepaid', 'defaults', 'valueDefaulted', 'cumulativeDefaultRatePercent'],
+                properties: {
+                  date: { type: 'string', format: 'date' },
+                  principalLent: { type: 'string' },
+                  principalRepaid: { type: 'string' },
+                  defaults: { type: 'integer' },
+                  valueDefaulted: { type: 'string' },
+                  cumulativeDefaultRatePercent: { type: 'number' },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  }, async (_req, reply) => {
+    setCachePolicy(reply, 'public-live')
+    const cached = await historyCache.get()
+    if (cached) return cached
+
+    const rows = await query<{
+      day: string
+      principal_lent: string
+      principal_repaid: string
+      defaults_count: number
+      value_defaulted: string
+      cumulative_originated: string
+      cumulative_defaults: string
+    }>(
+      `WITH bounds AS (
+         SELECT min(day) AS first_day, (now() AT TIME ZONE 'UTC')::date AS last_day
+           FROM daily_loan_stats
+       ), calendar AS (
+         SELECT generate_series(first_day, last_day, interval '1 day')::date AS day
+           FROM bounds
+          WHERE first_day IS NOT NULL
+       ), daily AS (
+         SELECT day, principal_lent, principal_repaid, defaults_count, value_defaulted,
+                loans_originated
+           FROM daily_loan_stats
+       )
+       SELECT calendar.day::text AS day,
+              COALESCE(daily.principal_lent, 0)::text AS principal_lent,
+              COALESCE(daily.principal_repaid, 0)::text AS principal_repaid,
+              COALESCE(daily.defaults_count, 0) AS defaults_count,
+              COALESCE(daily.value_defaulted, 0)::text AS value_defaulted,
+              SUM(COALESCE(daily.loans_originated, 0)) OVER (ORDER BY calendar.day)::text AS cumulative_originated,
+              SUM(COALESCE(daily.defaults_count, 0)) OVER (ORDER BY calendar.day)::text AS cumulative_defaults
+         FROM calendar
+         LEFT JOIN daily USING (day)
+        ORDER BY calendar.day`
+    )
+    const result = {
+      data: rows.map((row) => {
+        const originated = Number(row.cumulative_originated)
+        const defaults = Number(row.cumulative_defaults)
+        return {
+          date: row.day,
+          principalLent: row.principal_lent,
+          principalRepaid: row.principal_repaid,
+          defaults: row.defaults_count,
+          valueDefaulted: row.value_defaulted,
+          cumulativeDefaultRatePercent: originated === 0
+            ? 0
+            : Number(((defaults / originated) * 100).toFixed(4)),
+        }
+      }),
+    }
+    await historyCache.set(result)
+    return result
   })
 }

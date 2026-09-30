@@ -3,6 +3,7 @@ import type { LoanRow } from '../types.js'
 export type LoanWithDerived = LoanRow & {
   interest_charge: string | null
   repaid_amount: string | null
+  repayment_progress_bps: number | null
 }
 
 interface WarnLogger {
@@ -40,11 +41,29 @@ export function withLoanDerived(loan: LoanRow, log?: WarnLogger): LoanWithDerive
       { loanId: loan.id, amount: loan.amount, outstanding: loan.outstanding, total_repayment: loan.total_repayment },
       'loan has a malformed amount column; derived fields omitted'
     )
-    return { ...loan, interest_charge: null, repaid_amount: null }
+    return { ...loan, interest_charge: null, repaid_amount: null, repayment_progress_bps: null }
   }
+  const repaidAmount = totalRepayment - outstanding
   return {
     ...loan,
     interest_charge: (totalRepayment - amount).toString(),
-    repaid_amount: (totalRepayment - outstanding).toString(),
+    repaid_amount: repaidAmount.toString(),
+    repayment_progress_bps: repaymentProgressBps(repaidAmount, totalRepayment),
   }
+}
+
+// repaid_amount / total_repayment expressed in basis points (0 to 10,000),
+// server-side so the frontend doesn't duplicate this math (issue #286).
+// BigInt division truncates toward zero, so the multiply-then-divide order
+// matters here (`repaid * 10000n / total`, not the reverse) to keep
+// sub-basis-point precision from being lost before scaling up. Clamped to
+// [0, 10000] since outstanding can (in principle, from an upstream data
+// issue) exceed total_repayment or go negative, which would otherwise
+// produce a bps value outside the valid range.
+function repaymentProgressBps(repaidAmount: bigint, totalRepayment: bigint): number {
+  if (totalRepayment <= 0n) return 0
+  const bps = (repaidAmount * 10000n) / totalRepayment
+  if (bps < 0n) return 0
+  if (bps > 10000n) return 10000
+  return Number(bps)
 }

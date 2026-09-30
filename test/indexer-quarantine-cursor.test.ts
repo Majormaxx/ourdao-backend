@@ -33,7 +33,8 @@ vi.mock('../src/stellar/rpc.js', () => ({
 
 async function cursorRow() {
   return queryOne<{ last_ledger: number | null; observed_tip_ledger: number | null; paging_token: string | null }>(
-    'SELECT last_ledger, observed_tip_ledger, paging_token FROM indexer_cursor WHERE id = 1'
+    'SELECT last_ledger, observed_tip_ledger, paging_token FROM indexer_cursor WHERE contract_id = $1',
+    ['CTESTCONTRACT']
   )
 }
 
