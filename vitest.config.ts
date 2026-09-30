@@ -7,11 +7,10 @@ export default defineConfig({
     testTimeout: 10_000,
     hookTimeout: 10_000,
     setupFiles: ['./test/setup.ts'],
-    // All DB-backed test files share one physical test database (see
-    // test/db.ts). Running files in parallel lets one file's
-    // `resetDb()` TRUNCATE race another file's in-flight assertions —
-    // observed as flaky failures. Serialize file execution instead.
-    fileParallelism: false,
+    // Issue #204: Re-enabled parallel file execution. Each worker gets its own
+    // Postgres schema (test_worker_1, test_worker_2, etc.) set up in
+    // test/setup.ts, so TRUNCATE operations no longer race across files.
+    fileParallelism: true,
 
     // Coverage measurement (#79). `npm run test:coverage` writes a per-file
     // report; CI enforces the thresholds below and prints the summary to the
@@ -29,17 +28,34 @@ export default defineConfig({
         '**/*.config.*',
         'dist/**',
       ],
-      // PROVISIONAL — deliberately set a few points below what a
-      // "test every route and handler against real Postgres" suite is
-      // expected to reach, so this ratchets against regressions without
-      // failing on day one. Run `npm run test:coverage` once and raise each
-      // number to (measured − ~2%). The per-file report is the real
-      // deliverable; this is just the floor.
+      // Issue #208: Per-directory thresholds enforce coverage at module
+      // granularity rather than one aggregate. Indexer and auth have higher
+      // bars due to their risk profile (money-relevant state, authorization
+      // boundary). Current levels preserved on adoption (no immediate breaks).
       thresholds: {
         lines: 60,
         functions: 55,
         branches: 70,
         statements: 60,
+        // Per-directory thresholds (issue #208)
+        'src/indexer/**': {
+          lines: 85,
+          functions: 80,
+          branches: 80,
+          statements: 85,
+        },
+        'src/auth.ts': {
+          lines: 75,
+          functions: 70,
+          branches: 70,
+          statements: 75,
+        },
+        'src/api/**': {
+          lines: 70,
+          functions: 65,
+          branches: 75,
+          statements: 70,
+        },
       },
     },
   },
