@@ -42,6 +42,21 @@ function readPackageVersion(): { version: string; error?: unknown } {
 
 const packageVersionResult = readPackageVersion()
 
+// Issue #207: module-level storage for the nonce store so it can be shut down
+// gracefully when the process exits. Set by buildServer(), accessed by
+// shutdownNonceStore().
+let activeNonceStore: NonceStore | null = null
+
+/**
+ * Shut down the active nonce store's timers (issue #207). Called from the
+ * main process shutdown path (src/index.ts) before pool.end().
+ */
+export async function shutdownNonceStore(): Promise<void> {
+  if (activeNonceStore && 'shutdown' in activeNonceStore) {
+    await (activeNonceStore as { shutdown(): Promise<void> }).shutdown()
+  }
+}
+
 export interface BuildServerOptions {
   /**
    * Override the Fastify logger. Production passes nothing and gets the
@@ -79,6 +94,8 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   } else {
     nonceStore = new MemoryNonceStore()
   }
+  // Issue #207: store the nonce store for shutdown access
+  activeNonceStore = nonceStore
 
   // ── OpenAPI / Swagger (issue #215) ──
   await app.register(swagger, {

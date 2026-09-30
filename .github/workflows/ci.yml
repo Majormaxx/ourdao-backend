@@ -71,12 +71,65 @@ jobs:
             {
               echo '### Coverage'
               echo ''
+              echo '#### Overall'
+              echo ''
               echo '| metric | % | covered / total |'
               echo '| --- | --- | --- |'
               node -e '
                 const t = require("./coverage/coverage-summary.json").total;
                 for (const k of ["lines","statements","functions","branches"])
                   console.log(`| ${k} | ${t[k].pct}% | ${t[k].covered} / ${t[k].total} |`);
+              '
+              echo ''
+              echo '#### Per-Module Coverage (issue #208)'
+              echo ''
+              echo '| module | lines | functions | branches | statements |'
+              echo '| --- | --- | --- | --- | --- |'
+              node -e '
+                const summary = require("./coverage/coverage-summary.json");
+                const modules = {
+                  "src/indexer/": [],
+                  "src/auth.ts": [],
+                  "src/api/": [],
+                  "src/db/": [],
+                  "src/stellar/": [],
+                };
+                
+                // Aggregate coverage by module
+                for (const [file, data] of Object.entries(summary)) {
+                  if (file === "total") continue;
+                  
+                  for (const [module, files] of Object.entries(modules)) {
+                    if (file.includes(module)) {
+                      files.push(data);
+                      break;
+                    }
+                  }
+                }
+                
+                // Calculate and print per-module totals
+                for (const [module, files] of Object.entries(modules)) {
+                  if (files.length === 0) continue;
+                  
+                  const totals = { lines: {covered:0, total:0}, functions: {covered:0, total:0},
+                                   branches: {covered:0, total:0}, statements: {covered:0, total:0} };
+                  
+                  for (const file of files) {
+                    for (const metric of ["lines", "functions", "branches", "statements"]) {
+                      totals[metric].covered += file[metric].covered;
+                      totals[metric].total += file[metric].total;
+                    }
+                  }
+                  
+                  const pcts = {};
+                  for (const metric of ["lines", "functions", "branches", "statements"]) {
+                    pcts[metric] = totals[metric].total > 0 
+                      ? ((totals[metric].covered / totals[metric].total) * 100).toFixed(1)
+                      : "0.0";
+                  }
+                  
+                  console.log(`| ${module} | ${pcts.lines}% | ${pcts.functions}% | ${pcts.branches}% | ${pcts.statements}% |`);
+                }
               '
             } >> "$GITHUB_STEP_SUMMARY"
           fi

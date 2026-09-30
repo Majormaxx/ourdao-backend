@@ -1,6 +1,10 @@
 // Shared harness for DB-backed tests. Applies the real schema.sql to the test
 // database (see test/setup.ts for how DATABASE_URL is pointed there) and
 // truncates every table between tests so each test starts from empty state.
+//
+// Issue #204: Each vitest worker now has its own Postgres schema (set up in
+// test/setup.ts), making parallel execution safe. This file no longer needs
+// to worry about cross-worker races.
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
@@ -13,6 +17,7 @@ let schemaApplied: Promise<void> | null = null
 
 function applySchema(): Promise<void> {
   const sql = readFileSync(schemaPath, 'utf8')
+  // Schema is already set in test/setup.ts, so this applies to the worker's schema
   return pool.query(sql).then(() => undefined)
 }
 
@@ -32,6 +37,7 @@ const NON_DERIVED_TABLES = [
 export async function resetDb(): Promise<void> {
   await ensureSchema()
   const allTables = [...DERIVED_TABLES, ...NON_DERIVED_TABLES]
+  // Issue #204: TRUNCATE now safe to run in parallel — each worker has its own schema
   await pool.query(`TRUNCATE ${allTables.join(', ')} RESTART IDENTITY CASCADE`)
   // dao_totals is a fixed singleton — reset its values in place and make sure
   // the row exists (schema.sql seeds it, but be defensive against a partial
@@ -45,8 +51,7 @@ export async function resetDb(): Promise<void> {
 }
 
 export async function closeDb(): Promise<void> {
-  // Vitest runs files in one process with fileParallelism disabled. Individual
-  // files register this hook, so ending the shared pool here would make every
-  // later file fail with "Cannot use a pool after calling end". Vitest owns
-  // process cleanup after the suite; keep this hook for per-file symmetry.
+  // Issue #204: With fileParallelism enabled, each worker runs in its own
+  // thread pool. Pool cleanup is handled by test/setup.ts's exit handler.
+  // Keep this hook for per-file symmetry.
 }

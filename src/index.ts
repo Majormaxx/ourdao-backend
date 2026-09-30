@@ -1,23 +1,59 @@
 import { config } from './config.js'
 import { migrate } from './db/migrate.js'
 import { pool } from './db/index.js'
-import { buildServer } from './api/server.js'
+import { buildServer, shutdownNonceStore } from './api/server.js'
 import { shutdownSharedListener } from './api/stream.js'
+
+const SHUTDOWN_TIMEOUT_MS = 10_000
 
 async function main(): Promise<void> {
   await migrate()
   const app = await buildServer()
   await app.listen({ port: config.http.port, host: config.http.host })
 
+  // Issue #207: guard against re-entrant shutdown — two signals sent rapidly
+  // would otherwise invoke shutdown twice concurrently, causing the second
+  // pool.end() to throw "Called end on pool more than once".
+  let shuttingDown = false
   const shutdown = async (signal: string) => {
+    if (shuttingDown) {
+      app.log.info(`received ${signal} again while already shutting down, ignoring`)
+      return
+    }
+    shuttingDown = true
     app.log.info(`received ${signal}, shutting down`)
-    await app.close()
-    // Issue #152: the /api/stream shared listener holds a standalone
-    // connection outside `pool`, so it must be closed explicitly — `pool.end()`
-    // only waits on connections it checked out itself, and would otherwise
-    // have nothing to do with this one either way.
+
+    // Issue #207: bound the wait for app.close() so an in-flight request
+    // cannot hang shutdown forever (matches the worker's pattern in
+    // src/worker.ts). Race against a timeout; if the timeout wins, log it
+    // but continue anyway — the pool and listener still need to close.
+    let timedOut = false
+    const closePromise = app.close()
+    const timeout = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        timedOut = true
+        resolve()
+      }, SHUTDOWN_TIMEOUT_MS)
+    })
+    await Promise.race([closePromise, timeout])
+
+    if (timedOut) {
+      app.log.error(
+        `app.close() timed out after ${SHUTDOWN_TIMEOUT_MS}ms — continuing with pool/listener shutdown anyway`
+      )
+    }
+
+    // Issue #152 / #207: the /api/stream shared listener holds a standalone
+    // connection outside `pool`, and every open SSE connection holds a pool
+    // connection underneath a live LISTEN — close all of them explicitly
+    // before pool.end(), so pool.end() doesn't try to force-close
+    // connections that are mid-LISTEN.
     await shutdownSharedListener()
+    // Issue #207: shut down the nonce store's cleanup timers before ending
+    // the pool, so they don't fire after the pool is closed.
+    await shutdownNonceStore()
     await pool.end()
+    app.log.info('shutdown complete')
     process.exit(0)
   }
   process.on('SIGINT', () => void shutdown('SIGINT'))
