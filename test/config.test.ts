@@ -107,6 +107,13 @@ describe('resolveConfig', () => {
         quarantineAfterFailures: 3,
         resetOnContractChange: false,
       },
+      cache: {
+        redisUrl: undefined,
+        memberCacheTtlSeconds: 30,
+      },
+      maintenance: {
+        intervalMs: 7 * 24 * 60 * 60 * 1000,
+      },
     })
   })
 

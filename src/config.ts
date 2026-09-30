@@ -195,6 +195,26 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // raw `events` log is left intact as an audit trail.
     resetOnContractChange: bool(env, 'INDEXER_RESET_ON_CONTRACT_CHANGE', false),
   },
+  // Issue #277: Redis is a strictly optional read-through cache for the
+  // heaviest DAO reads (member list, per-address summary) — this is a
+  // read-heavy DAO backend and neither local dev nor the test suite should
+  // ever need a Redis instance. `redisUrl` unset means the cache helper
+  // no-ops (see src/cache/redis.ts): every read falls straight through to
+  // Postgres, exactly as before this issue.
+  cache: {
+    redisUrl: str(env, 'REDIS_URL') || undefined,
+    // 30s matches the existing `statsCacheMs` precedent above for the same
+    // class of problem: a burst of polls against the same key collapses to
+    // one Postgres read, and clients are never stale by more than this.
+    memberCacheTtlSeconds: int(env, 'MEMBER_CACHE_TTL_SECONDS', 30),
+  },
+  // Issue #279: periodic VACUUM ANALYZE + expired-row cleanup, run from the
+  // worker process (src/worker.ts) alongside the indexer loop.
+  maintenance: {
+    // Weekly by default — vacuuming is comparatively rare maintenance, not a
+    // hot-path concern; configurable for operators who want it tighter.
+    intervalMs: int(env, 'MAINTENANCE_INTERVAL_MS', 7 * 24 * 60 * 60 * 1000),
+  },
   } as const
 }
 
