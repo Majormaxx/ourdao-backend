@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify'
 import { randomUUID } from 'node:crypto'
 import type { ServerOptions } from 'node:http'
+import compress from '@fastify/compress'
 import cors from '@fastify/cors'
 import rateLimit from '@fastify/rate-limit'
 import etag from '@fastify/etag'
@@ -149,6 +150,19 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(etag)
   // Registered after etag so its onSend sees the final headers (issue #194).
   registerCachePolicy(app)
+
+  // ── Compression (issue #282) ──
+  // Registered after etag/cache-policy so both compute against the plain
+  // response body; compress is the last onSend transform, applied only once
+  // the payload and its headers are final. `threshold: 1024` skips the
+  // gzip/brotli overhead on small JSON bodies where compressing would cost
+  // more CPU than it saves in bytes — the endpoints this targets
+  // (`/api/loans`, `/api/events`) return arrays large enough to clear it.
+  await app.register(compress, {
+    global: true,
+    threshold: 1024,
+    encodings: ['br', 'gzip'],
+  })
 
   // ── CORS ──
   const origins = config.http.corsOrigin
