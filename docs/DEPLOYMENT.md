@@ -20,6 +20,7 @@ This document covers everything needed to run `ourdao-backend` outside a laptop:
 - [Container security and image scanning](#container-security-and-image-scanning)
 - [Redeploying the contract](#redeploying-the-contract)
 - [Operations](#operations)
+- [Reorg recovery](#reorg-recovery)
 - [Soroban RPC wire smoke testing](#soroban-rpc-wire-smoke-testing)
 - [Related repos](#related-repos)
 
@@ -482,7 +483,7 @@ A healthy, caught-up indexer has `lastIndexedLedger` within a few ledgers of `ob
 
 3. **Are there quarantined events?** `GET /api/stats` reports `quarantinedEvents`. A non-zero count means the indexer encountered an event it cannot process (usually a handler bug). The worker continues indexing past quarantined events — it does not halt — but the affected derived rows may be incomplete. See `GET /api/admin/failed-events` for detail. The fix is to patch the handler and run `npm run reindex`.
 
-4. **Did the indexer halt on a reorg?** A detected reorg causes the worker to stop immediately with a loud log line (`[indexer] reorg detected`). Confirm the chain state, then run `npm run reindex` to rebuild derived tables from the raw log. See [Reorg detection](../README.md#reorg-detection).
+4. **Did the indexer halt on a reorg?** A detected reorg causes the worker to stop immediately with a loud log line (`[indexer] LEDGER DISCONTINUITY DETECTED`) and a non-zero exit; it stays halted until an operator intervenes. Confirm the chain state, then run `npm run reindex` to rebuild derived tables from the raw log. The full diagnosis-and-recovery procedure — cursor queries, triage, step-by-step recovery — is the runbook: [Reorg recovery](./REORG_RECOVERY.md).
 
 5. **Is the worker simply catching up?** After a restart or a long RPC outage, the worker may have pages of backlog to drain. `DRAIN_MAX_PAGES` and `DRAIN_MAX_MS` control how aggressively it catches up per poll cycle. During catch-up, `lastIndexedLedger` advances steadily — watch it over 30–60 seconds to confirm progress.
 
@@ -503,7 +504,7 @@ Key log lines to monitor:
 | Pattern | Meaning |
 |---|---|
 | `[indexer] fatal:` | Worker crashed with an unhandled error — restart and investigate. |
-| `[indexer] reorg detected` | Reorg halt — manual recovery needed (see above). |
+| `[indexer] LEDGER DISCONTINUITY DETECTED` | Reorg halt — the worker exits and stays down until an operator runs the recovery in [Reorg recovery](#reorg-recovery). |
 | `[indexer] quarantining event` | An event was moved to `failed_events` — handler bug, review `GET /api/admin/failed-events`. |
 | `[indexer] received SIGTERM` | Clean shutdown started. |
 | `[indexer] shutdown complete` | Clean shutdown finished — safe to stop the container. |
@@ -519,6 +520,10 @@ docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
 ```
 
 This is safe to run at any time — it is idempotent and the result is always consistent with the raw log. It is the recovery path for reorgs, quarantined events (after fixing the handler), and any derived-table corruption. See [`docs/events-storage.md`](./events-storage.md) for expected run times at various log sizes.
+
+### Reorg recovery
+
+A full reorg alarm — what `[indexer] LEDGER DISCONTINUITY DETECTED` means, how the indexer noticed, the SQL to inspect the cursor, how to tell a real reorg from a misbehaving RPC, and the complete step-by-step recovery — has its own runbook: **[`REORG_RECOVERY.md`](./REORG_RECOVERY.md)**. Read it before improvising; the short form is "stop the worker, confirm the chain state, `npm run reindex`, restart the worker".
 
 ---
 

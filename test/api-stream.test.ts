@@ -5,6 +5,8 @@ import { pool } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
 import {
   DRAIN_STALL_DISCONNECT_MS,
+  HEARTBEAT_RETRY_INITIAL_MS,
+  HEARTBEAT_RETRY_MAX_MS,
   MAX_QUEUED_MESSAGES,
   PG_NOTIFY_MAX_PAYLOAD_BYTES,
   STREAM_CHANNELS,
@@ -411,7 +413,7 @@ describe('StreamClient backpressure', () => {
     }
   })
 
-  it('skips heartbeats for an already-backed-up client', async () => {
+  it('defers (does not immediately write) a heartbeat tick for an already-backed-up client', async () => {
     vi.useFakeTimers()
     try {
       const writable = { canWrite: true }
@@ -423,8 +425,9 @@ describe('StreamClient backpressure', () => {
       sc.receiveNotification(STREAM_CHANNELS.loans, {}) // trips pause
       const writesWhilePaused = raw.write.mock.calls.length
 
-      // Advance past a heartbeat interval; a backed-up client must not get
-      // another unflushable write queued on top of what it already owes.
+      // The 30s heartbeat tick itself must not queue another unflushable
+      // write on top of what the client already owes — see #285's
+      // scheduleHeartbeatRetry, which defers to a backoff retry instead.
       await vi.advanceTimersByTimeAsync(30_000)
       expect(raw.write.mock.calls.length).toBe(writesWhilePaused)
 
@@ -432,6 +435,120 @@ describe('StreamClient backpressure', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  // Issue #285: a heartbeat that lands mid-backpressure retries with
+  // exponential backoff instead of being silently dropped until the next
+  // fixed 30s tick.
+  //
+  // All three tests below trip pause 27s (not 0s) after start(), rather than
+  // immediately: the heartbeat interval and DRAIN_STALL_DISCONNECT_MS are
+  // both exactly 30s, so tripping pause at t=0 makes the first heartbeat
+  // tick and the stall-timeout disconnect land on the very same fake-timer
+  // tick, conflating what these tests are trying to isolate. Tripping pause
+  // at t=27s instead puts the first heartbeat tick (the fixed schedule from
+  // start(), at t=30s) only 3s after pause, and the stall timeout (armed
+  // relative to when pause was tripped) at t=57s — giving a clean ~27s
+  // window to observe retry behavior before the stall timer would fire.
+  describe('heartbeat exponential backoff retry (#285)', () => {
+    // Each retry tick genuinely attempts a write (issue #285's fix over an
+    // earlier draft that only re-checked a `paused` flag which, correctly,
+    // only updates on a real 'drain' event) — so `raw.write` is called on
+    // every attempt whether it succeeds or fails. Filtering by frame content
+    // isolates heartbeat attempts from the notification write that tripped
+    // pause in the first place.
+    function countHeartbeatWrites(raw: { write: ReturnType<typeof vi.fn> }): number {
+      return raw.write.mock.calls.filter(([frame]) => String(frame).includes('event: heartbeat')).length
+    }
+
+    it('sends the heartbeat via retry once the socket becomes writable again, without waiting for the next 30s tick', async () => {
+      vi.useFakeTimers()
+      try {
+        const writable = { canWrite: true }
+        const { reply, raw } = makeFakeStreamPair(writable)
+        const sc = new StreamClient(reply)
+        await sc.start([STREAM_CHANNELS.loans])
+
+        await vi.advanceTimersByTimeAsync(27_000)
+        writable.canWrite = false
+        sc.receiveNotification(STREAM_CHANNELS.loans, {}) // trips pause, arms the stall timer for t=57s
+
+        await vi.advanceTimersByTimeAsync(3_000) // to t=30s: the fixed heartbeat tick lands paused, schedules retry #1 (+1s)
+        expect(countHeartbeatWrites(raw)).toBe(0) // no attempt yet — just scheduled
+
+        // Socket recovers before the retry fires.
+        writable.canWrite = true
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_RETRY_INITIAL_MS) // to t=31s: retry #1 attempts, succeeds
+        expect(countHeartbeatWrites(raw)).toBe(1)
+
+        await sc.close()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('backs off exponentially, retrying (and failing) on a doubling schedule until the socket recovers', async () => {
+      vi.useFakeTimers()
+      try {
+        const writable = { canWrite: true }
+        const { reply, raw } = makeFakeStreamPair(writable)
+        const sc = new StreamClient(reply)
+        await sc.start([STREAM_CHANNELS.loans])
+
+        await vi.advanceTimersByTimeAsync(27_000)
+        writable.canWrite = false
+        sc.receiveNotification(STREAM_CHANNELS.loans, {}) // trips pause, arms the stall timer for t=57s
+        await vi.advanceTimersByTimeAsync(3_000) // to t=30s: schedules retry #1 (+1s)
+
+        await vi.advanceTimersByTimeAsync(1_000) // to t=31s: retry #1 attempts, still unwritable — fails, schedules retry #2 (+2s)
+        expect(countHeartbeatWrites(raw)).toBe(1)
+
+        await vi.advanceTimersByTimeAsync(2_000) // to t=33s: retry #2 attempts, still unwritable — fails, schedules retry #3 (+4s)
+        expect(countHeartbeatWrites(raw)).toBe(2)
+
+        // Recovery is picked up on the next retry attempt (#3), not before.
+        writable.canWrite = true
+        await vi.advanceTimersByTimeAsync(4_000) // to t=37s: retry #3 attempts, succeeds
+        expect(countHeartbeatWrites(raw)).toBe(3)
+
+        // Having succeeded, it must not keep retrying.
+        await vi.advanceTimersByTimeAsync(HEARTBEAT_RETRY_MAX_MS)
+        expect(countHeartbeatWrites(raw)).toBe(3)
+
+        await sc.close()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('never disconnects on its own — only the existing stall timer does', async () => {
+      vi.useFakeTimers()
+      try {
+        const writable = { canWrite: true }
+        const { reply, raw } = makeFakeStreamPair(writable)
+        const sc = new StreamClient(reply)
+        await sc.start([STREAM_CHANNELS.loans])
+
+        await vi.advanceTimersByTimeAsync(27_000)
+        writable.canWrite = false
+        sc.receiveNotification(STREAM_CHANNELS.loans, {}) // trips pause, arms the stall timer for t=57s
+        await vi.advanceTimersByTimeAsync(3_000) // to t=30s: heartbeat tick lands paused, starts retrying
+
+        // Right up to (but not past) the stall-timeout boundary at t=57s —
+        // several heartbeat retries (1s, 2s, 4s, 8s, ...) have fired by now,
+        // all while still unwritable; none of them should have closed the
+        // connection themselves.
+        await vi.advanceTimersByTimeAsync(DRAIN_STALL_DISCONNECT_MS - 3_000 - 1)
+        expect(raw.end).not.toHaveBeenCalled()
+
+        // The stall timer — armed by the original paused write, not by any
+        // heartbeat retry — is what actually disconnects, once it elapses.
+        await vi.advanceTimersByTimeAsync(2)
+        expect(raw.end).toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
   })
 
   it('close() is idempotent under concurrent close calls (issue #159)', async () => {

@@ -4,6 +4,7 @@ import {
   bool,
   int,
   nonceStore,
+  parseStellarRpcHeaders,
   resolveConfig,
   str,
 } from '../src/config.js'
@@ -51,6 +52,54 @@ describe('config helpers', () => {
   })
 })
 
+describe('parseStellarRpcHeaders (#284)', () => {
+  it('returns an empty object when unset or empty', () => {
+    expect(parseStellarRpcHeaders(undefined)).toEqual({})
+    expect(parseStellarRpcHeaders('')).toEqual({})
+    expect(parseStellarRpcHeaders('   ')).toEqual({})
+  })
+
+  it('parses a single Name:Value header', () => {
+    expect(parseStellarRpcHeaders('X-API-Key:abc123')).toEqual({ 'X-API-Key': 'abc123' })
+  })
+
+  it('parses multiple comma-separated headers, trimming whitespace', () => {
+    expect(parseStellarRpcHeaders(' X-API-Key : abc123 , Authorization:Bearer xyz ')).toEqual({
+      'X-API-Key': 'abc123',
+      Authorization: 'Bearer xyz',
+    })
+  })
+
+  it('treats only the first colon as the name/value separator', () => {
+    expect(parseStellarRpcHeaders('Authorization:Bearer abc:def:ghi')).toEqual({
+      Authorization: 'Bearer abc:def:ghi',
+    })
+  })
+
+  it('skips a malformed entry with no colon and warns, keeping valid entries', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(parseStellarRpcHeaders('X-API-Key:abc123,not-a-header,Authorization:Bearer xyz')).toEqual({
+        'X-API-Key': 'abc123',
+        Authorization: 'Bearer xyz',
+      })
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('skips an entry with an empty header name and warns', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(parseStellarRpcHeaders(':no-name')).toEqual({})
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
+  })
+})
+
 describe('resolveConfig', () => {
   it('matches every documented default', () => {
     const resolved = resolveConfig({})
@@ -89,6 +138,9 @@ describe('resolveConfig', () => {
         idleTimeoutMs: 30000,
         applicationName: 'ourdao-api',
       },
+      cache: {
+        historyRedisUrl: undefined,
+      },
       stellar: {
         contractId: '',
         rpcUrl: 'https://soroban-testnet.stellar.org',
@@ -106,6 +158,13 @@ describe('resolveConfig', () => {
         staleAfterMs: 120000,
         quarantineAfterFailures: 3,
         resetOnContractChange: false,
+      },
+      cache: {
+        redisUrl: undefined,
+        memberCacheTtlSeconds: 30,
+      },
+      maintenance: {
+        intervalMs: 7 * 24 * 60 * 60 * 1000,
       },
     })
   })

@@ -63,6 +63,42 @@ export function parseCorsOrigin(raw: string | undefined): string {
   return origins.length === 1 ? origins[0]! : origins.join(',')
 }
 
+/**
+ * Parses `STELLAR_RPC_HEADERS` (issue #284) into the header map
+ * `rpc.Server`'s `headers` option expects, so a managed Soroban RPC provider
+ * (QuickNode and similar) that requires an API key or bearer token can be
+ * authenticated against. Format: `Name1:Value1,Name2:Value2` — a colon
+ * separates each header's name from its value, a comma separates entries.
+ * A value may itself contain colons (e.g. `Authorization:Bearer abc:def`);
+ * only the first colon in an entry is treated as the separator.
+ *
+ * Malformed entries (no colon, or an empty name) are skipped with a warning
+ * rather than silently producing a broken header, since a header the RPC
+ * provider doesn't recognize fails requests in a way that's hard to trace
+ * back to a config typo.
+ */
+export function parseStellarRpcHeaders(raw: string | undefined): Record<string, string> {
+  const trimmed = (raw ?? '').trim()
+  if (trimmed === '') return {}
+
+  const headers: Record<string, string> = {}
+  for (const entry of trimmed.split(',')) {
+    const piece = entry.trim()
+    if (!piece) continue
+    const separatorIndex = piece.indexOf(':')
+    // separatorIndex <= 0 covers both "no colon at all" (-1) and "colon is
+    // the first character" (0, an empty name) in one check.
+    if (separatorIndex <= 0) {
+      console.warn(`[config] Ignoring malformed STELLAR_RPC_HEADERS entry (expected "Name:Value"): "${piece}"`)
+      continue
+    }
+    const name = piece.slice(0, separatorIndex).trim()
+    const value = piece.slice(separatorIndex + 1).trim()
+    headers[name] = value
+  }
+  return headers
+}
+
 /** Resolved runtime configuration, read once at import time. */
 export function resolveConfig(env: NodeJS.ProcessEnv) {
   return {
@@ -160,9 +196,25 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // pool is created, defaulting to `api`).
     applicationName: str(env, 'DB_APPLICATION_NAME') || `ourdao-${str(env, 'OURDAO_PROCESS_ROLE', 'api')}`,
   },
+  cache: {
+    historyRedisUrl: str(env, 'REDIS_URL') || undefined,
+  },
   stellar: {
     contractId: str(env, 'CONTRACT_ID'),
+    // Issue #289: multi-contract tailing (e.g. a governance DAO contract and
+    // a separate treasury vault contract) in one indexer process. CONTRACT_IDS
+    // is a comma-separated list and takes priority when set; CONTRACT_ID alone
+    // still works unchanged for existing single-contract deployments. Blank
+    // entries from stray commas/whitespace are dropped rather than producing
+    // an empty-string "contract" the RPC would reject.
+    contractIds: str(env, 'CONTRACT_IDS')
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
     rpcUrl: str(env, 'SOROBAN_RPC_URL', 'https://soroban-testnet.stellar.org'),
+    // Issue #284: custom headers (API key, bearer token) for managed/private
+    // Soroban RPC providers. Never log this value — see parseStellarRpcHeaders.
+    rpcHeaders: parseStellarRpcHeaders(env.STELLAR_RPC_HEADERS),
     networkPassphrase: str(env, 'NETWORK_PASSPHRASE', 'Test SDF Network ; September 2015'),
     // Stellar's nominal ledger close time (issue #139) — used by `/ready` to
     // turn a ledger-count lag into an estimated seconds-behind figure. Not an
@@ -195,6 +247,34 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // raw `events` log is left intact as an audit trail.
     resetOnContractChange: bool(env, 'INDEXER_RESET_ON_CONTRACT_CHANGE', false),
   },
+  // Issue #277: Redis is a strictly optional read-through cache for the
+  // heaviest DAO reads (member list, per-address summary) — this is a
+  // read-heavy DAO backend and neither local dev nor the test suite should
+  // ever need a Redis instance. `redisUrl` unset means the cache helper
+  // no-ops (see src/cache/redis.ts): every read falls straight through to
+  // Postgres, exactly as before this issue.
+  cache: {
+    redisUrl: str(env, 'REDIS_URL') || undefined,
+    // 30s matches the existing `statsCacheMs` precedent above for the same
+    // class of problem: a burst of polls against the same key collapses to
+    // one Postgres read, and clients are never stale by more than this.
+    memberCacheTtlSeconds: int(env, 'MEMBER_CACHE_TTL_SECONDS', 30),
+  },
+  // Issue #279: periodic VACUUM ANALYZE + expired-row cleanup, run from the
+  // worker process (src/worker.ts) alongside the indexer loop.
+  maintenance: {
+    // Weekly by default — vacuuming is comparatively rare maintenance, not a
+    // hot-path concern; configurable for operators who want it tighter.
+    intervalMs: int(env, 'MAINTENANCE_INTERVAL_MS', 7 * 24 * 60 * 60 * 1000),
+  otel: {
+    // Issue #288: tracing is opt-in — most local/dev/test runs have no OTLP
+    // collector to send spans to, and OpenTelemetry's own SDK already
+    // defaults to a no-op tracer when nothing registers a real provider, so
+    // this just controls whether src/telemetry.ts bothers registering one.
+    enabled: bool(env, 'OTEL_ENABLED', false),
+    exporterOtlpEndpoint: str(env, 'OTEL_EXPORTER_OTLP_ENDPOINT', 'http://localhost:4318/v1/traces'),
+    serviceName: str(env, 'OTEL_SERVICE_NAME', 'ourdao-backend'),
+  },
   } as const
 }
 
@@ -210,4 +290,25 @@ export function assertContractConfigured(resolvedConfig: Config = config): strin
     )
   }
   return resolvedConfig.stellar.contractId
+}
+
+/** Issue #289: resolves the full set of contract ids to tail. CONTRACT_IDS
+ *  (comma-separated) takes priority; a single CONTRACT_ID is wrapped in a
+ *  one-element array for existing single-contract deployments. Throws if
+ *  neither is set, or if the same contract id appears more than once (that
+ *  would mean two independent cursor rows racing to fold the same events). */
+export function assertContractsConfigured(resolvedConfig: Config = config): string[] {
+  if (resolvedConfig.stellar.contractIds.length > 0) {
+    const seen = new Set<string>()
+    const dupes = new Set<string>()
+    for (const id of resolvedConfig.stellar.contractIds) {
+      if (seen.has(id)) dupes.add(id)
+      seen.add(id)
+    }
+    if (dupes.size > 0) {
+      throw new Error(`CONTRACT_IDS lists the same contract id more than once: ${[...dupes].join(', ')}`)
+    }
+    return resolvedConfig.stellar.contractIds
+  }
+  return [assertContractConfigured(resolvedConfig)]
 }

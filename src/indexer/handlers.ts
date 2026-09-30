@@ -1,7 +1,41 @@
 import type { PoolClient } from 'pg'
+import { SpanStatusCode } from '@opentelemetry/api'
 import { isKnownSymbol, warnUnknownSymbol, type DecodedEvent } from '../stellar/events.js'
 import { STREAM_CHANNELS, type StreamChannel } from '../api/stream.js'
+import { getTracer } from '../telemetry.js'
 import type { NotificationType } from '../types.js'
+
+async function incrementDailyLoanStats(
+  client: PoolClient,
+  ev: DecodedEvent,
+  deltas: {
+    loansOriginated?: number
+    principalLent?: string
+    principalRepaid?: string
+    defaultsCount?: number
+    valueDefaulted?: string
+  }
+): Promise<void> {
+  await client.query(
+    `INSERT INTO daily_loan_stats
+       (day, loans_originated, principal_lent, principal_repaid, defaults_count, value_defaulted)
+     VALUES (($1::timestamptz AT TIME ZONE 'UTC')::date, $2, $3, $4, $5, $6)
+     ON CONFLICT (day) DO UPDATE SET
+       loans_originated = daily_loan_stats.loans_originated + EXCLUDED.loans_originated,
+       principal_lent = daily_loan_stats.principal_lent + EXCLUDED.principal_lent,
+       principal_repaid = daily_loan_stats.principal_repaid + EXCLUDED.principal_repaid,
+       defaults_count = daily_loan_stats.defaults_count + EXCLUDED.defaults_count,
+       value_defaulted = daily_loan_stats.value_defaulted + EXCLUDED.value_defaulted`,
+    [
+      ev.closedAt,
+      deltas.loansOriginated ?? 0,
+      deltas.principalLent ?? '0',
+      deltas.principalRepaid ?? '0',
+      deltas.defaultsCount ?? 0,
+      deltas.valueDefaulted ?? '0',
+    ]
+  )
+}
 
 // Helpers ------------------------------------------------------------------
 //
@@ -33,7 +67,7 @@ export class FieldValidationError extends Error {
   }
 }
 
-function requireAddr(ev: DecodedEvent, field: string): string {
+export function requireAddr(ev: DecodedEvent, field: string): string {
   const v = ev.fields[field]
   if (typeof v !== 'string' || v === '') {
     throw new FieldValidationError(ev, field, `must be a non-empty address string, got ${JSON.stringify(v)}`)
@@ -41,19 +75,29 @@ function requireAddr(ev: DecodedEvent, field: string): string {
   return v
 }
 
-function requireId(ev: DecodedEvent, field: string): number {
+export function requireId(ev: DecodedEvent, field: string): number {
   const v = ev.fields[field]
-  const n = Number(v)
-  if (v == null || !Number.isFinite(n) || !Number.isInteger(n)) {
+  // Gate on the value's *type* before coercing, not only on the coerced
+  // result. `Number()` accepts booleans and arrays, so the old
+  // `Number.isInteger(Number(v))` check silently turned `true` into id 1,
+  // `[]` into id 0 and `[5]` into id 5 — the same "this event didn't decode,
+  // write something plausible anyway" failure issue #42 is about, one level
+  // down. Contract ids are u32 and decode to a JS number; a plain
+  // decimal-integer string is also accepted because `toJsonSafe` stringifies
+  // any bigint that reaches it (events.ts).
+  const isIntLike =
+    (typeof v === 'number' && Number.isInteger(v)) ||
+    (typeof v === 'string' && /^\d+$/.test(v))
+  if (!isIntLike) {
     throw new FieldValidationError(ev, field, `must be a finite integer id, got ${JSON.stringify(v)}`)
   }
-  return n
+  return Number(v)
 }
 
 /** i128 amounts arrive as decimal-integer strings (bigints are stringified
  *  upstream in toJsonSafe) or, for small values, as a JS number. Never
  *  negative — every amount field here is a magnitude, not a signed delta. */
-function requireAmount(ev: DecodedEvent, field: string): string {
+export function requireAmount(ev: DecodedEvent, field: string): string {
   const v = ev.fields[field]
   const s = typeof v === 'number' && Number.isFinite(v) ? String(v) : v
   if (typeof s !== 'string' || !/^\d+$/.test(s)) {
@@ -62,7 +106,7 @@ function requireAmount(ev: DecodedEvent, field: string): string {
   return s
 }
 
-function requireBool(ev: DecodedEvent, field: string): boolean {
+export function requireBool(ev: DecodedEvent, field: string): boolean {
   const v = ev.fields[field]
   if (typeof v !== 'boolean') {
     throw new FieldValidationError(ev, field, `must be a boolean, got ${JSON.stringify(v)}`)
@@ -85,7 +129,7 @@ function normalizeProposalKind(v: unknown): 'loan' | 'treasury' | null {
   return lower === 'loan' || lower === 'treasury' ? lower : null
 }
 
-function requireProposalKind(ev: DecodedEvent, field: string): 'loan' | 'treasury' {
+export function requireProposalKind(ev: DecodedEvent, field: string): 'loan' | 'treasury' {
   const kind = normalizeProposalKind(ev.fields[field])
   if (kind === null) {
     throw new FieldValidationError(ev, field, `must be a ProposalKind ("Loan"/"Treasury"), got ${JSON.stringify(ev.fields[field])}`)
@@ -334,6 +378,7 @@ const handlers: Record<string, Handler> = {
         `UPDATE dao_totals SET principal_lent = principal_lent + $1, updated_at = now() WHERE id = 1`,
         [amount]
       )
+      await incrementDailyLoanStats(client, ev, { loansOriginated: 1, principalLent: amount })
     }
     await client.query(
       `UPDATE members SET has_active_loan = true WHERE address = $1`,
@@ -367,6 +412,7 @@ const handlers: Record<string, Handler> = {
         `UPDATE dao_totals SET principal_repaid = principal_repaid + $1, updated_at = now() WHERE id = 1`,
         [loan.amount]
       )
+      await incrementDailyLoanStats(client, ev, { principalRepaid: loan.amount })
     }
     if (status === 'repaid') {
       await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [borrower])
@@ -401,6 +447,10 @@ const handlers: Record<string, Handler> = {
       `UPDATE dao_totals SET value_defaulted = value_defaulted + $1, updated_at = now() WHERE id = 1`,
       [updated.rows[0]?.outstanding ?? '0']
     )
+    await incrementDailyLoanStats(client, ev, {
+      defaultsCount: 1,
+      valueDefaulted: updated.rows[0]?.outstanding ?? '0',
+    })
 
     await client.query(
       `UPDATE members
@@ -694,7 +744,27 @@ export async function applyEvent(client: PoolClient, ev: DecodedEvent): Promise<
   if (!isKnownSymbol(ev.symbol)) warnUnknownSymbol(ev)
 
   const handler = handlers[ev.symbol]
-  if (handler) await handler(client, ev)
+  // Issue #288: one span per event, whether or not a handler actually runs
+  // for it (an unknown symbol is still worth seeing in a trace) — visibility
+  // into which handlers are slowest during high transaction volume is the
+  // whole point, and skipping the no-handler case would silently exclude
+  // whatever fraction of events those are from that picture.
+  await getTracer().startActiveSpan('indexer.apply_event', async (span) => {
+    span.setAttribute('event.symbol', ev.symbol)
+    if (typeof ev.ledger === 'number') span.setAttribute('event.ledger', ev.ledger)
+    span.setAttribute('event.has_handler', handler !== undefined)
+    const startedAt = performance.now()
+    try {
+      if (handler) await handler(client, ev)
+    } catch (err) {
+      span.recordException(err instanceof Error ? err : String(err))
+      span.setStatus({ code: SpanStatusCode.ERROR })
+      throw err
+    } finally {
+      span.setAttribute('event.handler_duration_ms', performance.now() - startedAt)
+      span.end()
+    }
+  })
 
   return channelMap[ev.symbol]
 }
