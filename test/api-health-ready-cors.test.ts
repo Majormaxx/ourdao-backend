@@ -57,6 +57,24 @@ describe('API: /health and /ready', () => {
     expect(body.status).toBe('ok')
   })
 
+  it('GET /health/dependencies reports Postgres and RPC status indicators (issue #276)', async () => {
+    const res = await app.inject({ method: 'GET', url: '/health/dependencies' })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body.postgres.status).toBe('ok')
+    expect(typeof body.postgres.latencyMs).toBe('number')
+    expect(['ok', 'degraded', 'error']).toContain(body.rpc.status)
+    expect(typeof body.rpc.latencyMs).toBe('number')
+  })
+
+  it('GET /metrics exposes Prometheus text format including SSE metrics (issue #274)', async () => {
+    const res = await app.inject({ method: 'GET', url: '/metrics' })
+    expect(res.statusCode).toBe(200)
+    expect(res.headers['content-type']).toContain('text/plain')
+    expect(res.body).toContain('ourdao_sse_connections')
+    expect(res.body).toContain('ourdao_sse_messages_total')
+  })
+
   it('GET /version returns 200 with version info', async () => {
     const res = await app.inject({ method: 'GET', url: '/version' })
     expect(res.statusCode).toBe(200)

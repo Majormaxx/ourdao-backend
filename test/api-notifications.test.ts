@@ -30,6 +30,23 @@ describe('API: notification mutations', () => {
     expect(res.statusCode).toBe(400)
   })
 
+  it('GET /api/notifications supports before-id cursor pagination', async () => {
+    await query(
+      `INSERT INTO notifications (id, address, type, title, message) VALUES
+       (10, $1, 'info', 't', 'm'), (11, $1, 'info', 't', 'm'), (12, $1, 'info', 't', 'm')`,
+      [address]
+    )
+    const res = await app.inject({ method: 'GET', url: `/api/notifications?address=${address}&before=12&limit=1` })
+    const body = res.json()
+    expect(body).toHaveLength(1)
+    expect(body[0].id).toBe(11)
+  })
+
+  it('GET /api/notifications rejects an invalid before cursor', async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/notifications?address=${address}&before=not-a-number` })
+    expect(res.statusCode).toBe(400)
+  })
+
   it('PATCH /api/notifications/:id/read marks that row read and 404s for a missing id', async () => {
     const [row] = await query<{ id: number }>(
       `INSERT INTO notifications (address, type, title, message) VALUES ($1, 'info', 't', 'm') RETURNING id`,
